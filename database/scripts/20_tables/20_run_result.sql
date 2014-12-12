@@ -2,11 +2,10 @@
 CREATE SEQUENCE @extschema@.run_log_rl_id_seq;
 CREATE TABLE @extschema@.run_log (
     rl_id               integer not null default nextval('run_log_rl_id_seq') primary key,
-    function_name       name not null,
+    rl_job_id           integer references @extschema@.job(job_id) ON DELETE SET NULL,
     user_name           name not null,
-    job_id              integer,
-    schema_name         name,
-    function_arguments  hstore,
+    function_signature  text not null,
+    function_arguments  text[] not null default '{}'::text[],
     run_started         timestamptz,
     run_finished        timestamptz,
     rows_returned       bigint,
