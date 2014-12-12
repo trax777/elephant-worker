@@ -66,6 +66,21 @@ We leave it up to the writer of the jobs to store their output in their own tabl
 We do however return the number of rows affected, and if an error occurs, we will log
 as much information about the error as possible.
 
+Static resolving or dynamic resolving
+=====================================
+As schema names, user names, search_paths etc. can change we need to decide
+whether we are going to use dynamic resolving of functions vs static.
+
+Basically: Do we store oid's, which will survive renames of users and schema's?
+We cannot however create foreign keys to the system tables, so that would be a bit iffy.
+
+Or do we want to use dynamic resolving, which will survive a dump- and restore, which
+will honour search_path changes?
+
+We can also use intelligent dynamic resolving: during insert we check whether the function signature is valid,
+for example with a check ( function_signature::regprocedure::text = function_signature ) on the column, which
+will check the existence of the function during insert.
+
 DECISIONS TO MAKE
 =================
 - We will only accept security definer functions
@@ -75,3 +90,4 @@ DECISIONS TO MAKE
 - These checks will be made during executing
 - We will not capture the full output from the executed functions
 - We will use security barrier views to enable row level security
+- We will use "dynamic" resolving of function names and user names
