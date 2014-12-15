@@ -20,7 +20,7 @@ CREATE TABLE @extschema@.job (
     job_id              serial primary key,
     datoid              oid not null,
     useroid             oid not null,
-    schedule            text [] not null,
+    schedule            text [],
     enabled             boolean not null default true,
     failure_count       integer not null default 0 check ( failure_count>=0 ),
     success_count       integer not null default 0 check ( success_count>=0 ),
@@ -29,40 +29,32 @@ CREATE TABLE @extschema@.job (
     job_description     text,
     job_timeout         interval not null default '6 hours'::interval,
     last_executed       timestamptz,
-    check ( pg_has_role(current_user, useroid, 'MEMBER') ),
-    check ( array_length(schedule, 1) = 5)
+    check ( schedule IS NULL OR array_length(schedule, 1) = 5)
 );
-SELECT pg_catalog.pg_extension_config_dump('job', '');
+CREATE UNIQUE INDEX job_unique_definition_and_schedule ON @extschema@.job(datoid, useroid, coalesce(schedule,'{}'::text[]), job_command);
 COMMENT ON TABLE @extschema@.job IS
 'This table holds all the job definitions.';
-
--- Sequence is allowed to be used by all,
--- so get the sequence name and grant access to job_scheduler
-DO
-$BODY$
-DECLARE
-    seqname text;
-BEGIN
-    SELECT pg_catalog.pg_get_serial_sequence('@extschema@.job', 'job_id')
-      INTO seqname;
-    EXECUTE format('GRANT USAGE ON %s TO job_scheduler;', seqname);
-END;
-$BODY$;
-
+SELECT pg_catalog.pg_extension_config_dump('job', '');
 
 
 CREATE VIEW @extschema@.my_job WITH (security_barrier) AS
-SELECT *
+SELECT *,
+       (SELECT datname FROM pg_catalog.pg_database WHERE oid=datoid) AS datname,
+       (SELECT rolname FROM pg_catalog.pg_roles    WHERE oid=useroid) AS rolname
   FROM @extschema@.job
- WHERE useroid = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname=current_user);
+ WHERE useroid = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname=current_user)
+  WITH CASCADED CHECK OPTION;
 COMMENT ON VIEW @extschema@.my_job IS
 'This view shows all the job definitions of the current_user.
 This view is a filter of @extschema@.job, for more details, look at the comments of that table.';
 
 CREATE VIEW @extschema@.member_job WITH (security_barrier) AS
-SELECT *
+SELECT *,
+       (SELECT datname FROM pg_catalog.pg_database WHERE oid=datoid) AS datname,
+       (SELECT rolname FROM pg_catalog.pg_roles    WHERE oid=useroid) AS rolname
   FROM @extschema@.job
- WHERE pg_has_role(current_user, (SELECT oid FROM pg_catalog.pg_roles WHERE oid=useroid), 'MEMBER');
+ WHERE pg_has_role(current_user, (SELECT oid FROM pg_catalog.pg_roles WHERE oid=useroid), 'MEMBER')
+  WITH CASCADED CHECK OPTION;
 COMMENT ON VIEW @extschema@.member_job IS
 'This view shows all the job definitions of the users of which the current_user is a member.
 This view is a filter of @extschema@.job, for more details, look at the comments of that table.';
@@ -70,20 +62,13 @@ This view is a filter of @extschema@.job, for more details, look at the comments
 COMMENT ON COLUMN @extschema@.job.useroid IS
 'The user this job should be run as. To schedule a job you must be a member of this role.';
 
-REVOKE ALL ON TABLE @extschema@.job FROM PUBLIC;
-
 -- Needs more finegraining
-GRANT SELECT, DELETE ON @extschema@.my_job TO job_scheduler;
-GRANT SELECT, DELETE ON @extschema@.member_job TO job_scheduler;
+GRANT SELECT, DELETE, INSERT, UPDATE ON @extschema@.my_job TO job_scheduler;
+GRANT SELECT, DELETE, INSERT, UPDATE ON @extschema@.member_job TO job_scheduler;
 GRANT SELECT ON @extschema@.job TO job_monitor;
-
-
-
---minute AND hour AND month AND (dom OR dow)
 -- We explicitly name the sequence, as we use it in function calls also
-CREATE SEQUENCE @extschema@.run_log_rl_id_seq;
 CREATE TABLE @extschema@.run_log (
-    rl_id               integer not null default nextval('run_log_rl_id_seq') primary key,
+    rl_id               serial primary key,
     rl_job_id           integer references @extschema@.job(job_id) ON DELETE SET NULL,
     user_name           name not null,
     function_signature  text not null,
@@ -96,87 +81,113 @@ CREATE TABLE @extschema@.run_log (
     exception_detail    text,
     exception_hint      text
 );
-ALTER SEQUENCE @extschema@.run_log_rl_id_seq OWNED BY run_log.rl_id;
-GRANT USAGE ON @extschema@.run_log_rl_id_seq TO elephant_scheduler;
-GRANT INSERT ON @extschema@.run_log TO elephant_scheduler;
-
 -- Make sure the contents of this table is dumped when pg_dump is called
 SELECT pg_catalog.pg_extension_config_dump('run_log', '');
+CREATE FUNCTION @extschema@.insert_job(
+        job_command text,
+        datname name,
+        schedule text[] default null,
+        rolname name default current_user,
+        job_description text default null,
+        enabled boolean default true,
+        job_timeout interval default '6 hours',
+        parallel boolean default false)
+RETURNS @extschema@.my_job
+LANGUAGE SQL
+AS
+$BODY$
+    INSERT INTO @extschema@.member_job (
+        job_command,
+        schedule,
+        job_description,
+        enabled,
+        job_timeout,
+        parallel,
+        useroid,
+        datoid)
+    VALUES (
+        insert_job.job_command,
+        insert_job.schedule,
+        insert_job.job_description,
+        insert_job.enabled,
+        insert_job.job_timeout,
+        insert_job.parallel,
+        (SELECT oid FROM pg_catalog.pg_roles    pr WHERE pr.rolname= insert_job.rolname),
+        (SELECT oid FROM pg_catalog.pg_database pd WHERE pd.datname = insert_job.datname)
+    )
+    RETURNING *;
+$BODY$;
+CREATE FUNCTION @extschema@.update_job(
+		job_id integer,
+        job_command text default null,
+        datname name default null,
+        schedule text[] default null,
+        rolname name default null,
+        job_description text default null,
+        enabled boolean default null,
+        job_timeout interval default null,
+        parallel boolean default null)
+RETURNS @extschema@.my_job
+LANGUAGE SQL
+AS
+$BODY$
+	UPDATE @extschema@.member_job mj SET
+		job_command     = coalesce(update_job.job_command,     job_command),
+		schedule        = coalesce(update_job.schedule,        schedule),
+		job_description = coalesce(update_job.job_description, job_description),
+		enabled         = coalesce(update_job.enabled,         enabled),
+		job_timeout     = coalesce(update_job.job_timeout,     job_timeout),
+		parallel        = coalesce(update_job.parallel,        parallel),
+		useroid         = (SELECT oid FROM pg_catalog.pg_roles    pr WHERE pr.rolname = coalesce(update_job.rolname, mj.rolname)),
+		datoid          = (SELECT oid FROM pg_catalog.pg_database pd WHERE pd.datname = coalesce(update_job.datname, mj.datname))
+	WHERE job_id     = update_job.job_id
+    RETURNING *;
+$BODY$;
+CREATE FUNCTION @extschema@.delete_job(job_id integer)
+RETURNS @extschema@.my_job
+LANGUAGE SQL
+AS
+$BODY$
+    DELETE FROM @extschema@.member_job mj
+    WHERE mj.job_id=delete_job.job_id
+    RETURNING *;
+$BODY$;
 CREATE FUNCTION @extschema@.validate_job_definition() RETURNS TRIGGER AS
 $BODY$
-BEGIN
-    IF      TG_OP = 'INSERT'
-         OR OLD.function_signature != NEW.function_signature
-         OR OLD.function_arguments != NEW.function_arguments
-    THEN
-        PERFORM @extschema@.validate_job_definition(NEW);
-    END IF;
-    RETURN NEW;
-END;
-$BODY$
-LANGUAGE plpgsql;
-
-CREATE FUNCTION @extschema@.validate_job_definition(job @extschema@.job) RETURNS VOID AS
-$BODY$
 DECLARE
-    function_nargs smallint;
-    provided_nargs smallint;
-    function_owner name;
-    function_secdef boolean;
+    schedule_length integer;
 BEGIN
-    IF NOT pg_catalog.pg_has_role(current_user, job.user_name, 'MEMBER')
+    IF NEW.useroid IS NULL
+    THEN
+        SELECT oid
+          INTO NEW.useroid
+          FROM pg_catalog.pg_roles
+         WHERE rolname=current_user;
+    END IF;
+
+    IF NOT pg_catalog.pg_has_role(current_user, NEW.useroid, 'MEMBER')
     THEN
         RAISE SQLSTATE '42501' USING
         MESSAGE = 'Insufficient privileges',
         DETAIL  = format('You are not a member of role "%s"', user_name);
     END IF;
 
-    BEGIN
-        SELECT pronargs,
-               rolname,
-               prosecdef,
-               coalesce( array_length(job.function_arguments, 1), 0)
-          INTO function_nargs,
-               function_owner,
-               function_secdef,
-               provided_nargs
-          FROM pg_catalog.pg_proc  pp
-          JOIN pg_catalog.pg_roles pr ON (proowner=pr.oid)
-        WHERE pp.oid = job.function_signature::regprocedure;
-    EXCEPTION
-        WHEN undefined_function THEN
-            RAISE SQLSTATE '42883' USING
-            MESSAGE = format('function "%s" does not exist', job.function_signature),
-            HINT    = 'Make sure the search_path is correct, or fully qualify your function signature.';
-    END;
-
-    IF function_nargs <> provided_nargs
+    schedule_length := array_length( NEW.schedule, 1 );
+    IF schedule_length <> 5
     THEN
-        RAISE SQLSTATE '22023' USING
-        MESSAGE = 'Number of arguments provided differs from number of arguments of function.',
-        DETAIL  = format('Function arguments: %s, arguments provided: %s', function_nargs, provided_nargs);
+        IF schedule_length <> 1
+        THEN
+            RAISE SQLSTATE '22023' USING
+            MESSAGE = 'Invalid crontab entry',
+            DETAIL  = format('You provided an array with %s elements, we require 1 or 5', schedule_length ),
+            HINT    = E'Use valid crontab syntax; for example:\n*/2 1,2,[4-8], * * *\n@monthly';
+        END IF;
     END IF;
 
-    IF job.user_name <> function_owner THEN
-        RAISE SQLSTATE '42501' USING
-        MESSAGE = 'Insufficient privileges',
-        DETAIL  = format('Owner of the function does not equal the job user_name. Owner: %s, user_name: %s', function_owner, job.user_name),
-        HINT    = 'Schedule the job using the user_name of the function owner.';
-    END IF;
-
-    IF NOT function_secdef THEN
-        RAISE SQLSTATE '42P13' USING
-        MESSAGE = 'Invalid function definition',
-        DETAIL  = 'Function is not a security definer function.',
-        HINT    = 'Alter the function into a security definer function.';
-    END IF;
-
+    RETURN NEW;
 END;
 $BODY$
 LANGUAGE plpgsql;
-
-COMMENT ON FUNCTION @extschema@.validate_job_definition(@extschema@.job) IS
-'See comments for @extschema@.validate_job_definition()';
 
 COMMENT ON FUNCTION @extschema@.validate_job_definition() IS
 $$We want to maintain some sanity on the @extschema@.job table. We could do this with check constraints, for example:
@@ -190,7 +201,56 @@ However, these check constraints will always be evaluated, even if we want to di
 We also do not wish to have a foreign key relation with the system catalogs (if it were possible).
 But we want to temporary disable a job which is temporarily invalid. Therefore we use a trigger to enforce the sanity of this table.
 
+We also convert scheduler entries if needed.
 This trigger does not alter any data, it only validates.$$;
 
 CREATE TRIGGER validate_job_definition BEFORE INSERT OR UPDATE ON @extschema@.job
     FOR EACH ROW EXECUTE PROCEDURE @extschema@.validate_job_definition();
+DO
+$$
+DECLARE
+    relation_cursor CURSOR FOR
+        SELECT relname
+          FROM pg_catalog.pg_depend    pd
+          JOIN pg_catalog.pg_extension pe ON (pd.refobjid = pe.oid)
+          JOIN pg_catalog.pg_class     pc ON (pd.objid    = pc.oid)
+         WHERE deptype='e'
+           AND extname='elephant_worker'
+           AND relkind in ('r', 'v', 'm');
+
+    sequence_cursor CURSOR FOR
+        SELECT relname
+          FROM pg_catalog.pg_depend    pd
+          JOIN pg_catalog.pg_extension pe ON (pd.refobjid = pe.oid)
+          JOIN pg_catalog.pg_class     pc ON (pd.objid    = pc.oid)
+         WHERE deptype='e'
+           AND extname='elephant_worker'
+           AND relkind in ('S');
+
+    function_cursor CURSOR FOR
+        SELECT proname,
+               pg_catalog.pg_get_function_identity_arguments(pp.oid) as identity_arguments
+          FROM pg_catalog.pg_depend    pd
+          JOIN pg_catalog.pg_extension pe ON (pd.refobjid = pe.oid)
+          JOIN pg_catalog.pg_proc      pp ON (pd.objid    = pp.oid)
+         WHERE deptype='e'
+           AND extname='elephant_worker';
+BEGIN
+    FOR object IN relation_cursor
+    LOOP
+        EXECUTE format('REVOKE ALL ON %I.%I FROM PUBLIC', '@extschema@', object.relname);
+    END LOOP;
+
+    FOR object IN sequence_cursor
+    LOOP
+        EXECUTE format('REVOKE ALL ON SEQUENCE %I.%I FROM PUBLIC', '@extschema@', object.relname);
+        EXECUTE format('GRANT USAGE ON SEQUENCE %I.%I TO job_scheduler', '@extschema@', object.relname);
+    END LOOP;
+
+    FOR object IN function_cursor
+    LOOP
+        EXECUTE format('REVOKE ALL ON FUNCTION %I.%I(%s) FROM PUBLIC', '@extschema@', object.proname, object.identity_arguments);
+        EXECUTE format('GRANT EXECUTE ON FUNCTION %I.%I(%s) TO job_scheduler', '@extschema@', object.proname, object.identity_arguments);
+    END LOOP;
+END;
+$$;
