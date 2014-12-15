@@ -14,13 +14,77 @@ There are some already existing implementations of a cron job for databases, i.e
 
 One will be able to configure this job using a customisable database table, which holds the same attributes as a normal crontab, but offering a query instead of a shell command to run. With 9.4 dynamic background workers we can run multiple processes at once to execute jobs when necessary.
 
-Some design ideas can borrowed from the blog post on pg_cron.
-http://michael.otacoo.com/postgresql-2/and-what-about-pg_cron-with-background-workers-2/
+Some design ideas can borrowed from the blog post on pg\_cron.
+http://michael.otacoo.com/postgresql-2/and-what-about-pg\_cron-with-background-workers-2/
 
 Background workers are written in C and linked against PostgreSQL, so this task would require your knowledge of C and interest in database internals if you want to be a developer. Alternatively, you can wear a PM hat and participate in the feature design. Or, if you are a QA person, we can use your skills to make sure the module works as expected even in corner cases.
 
 Don't let C and low-level stuff frighten you off, to help us, there is a sample implementation of a background worker, a documentation page explaining the basic data structures and functions, and a blog post describing the background worker improvements in 9.4.
 
-https://github.com/postgres/postgres/tree/master/src/test/modules/worker_spi
+https://github.com/postgres/postgres/tree/master/src/test/modules/worker\_spi
 http://www.postgresql.org/docs/9.4/static/bgworker.html
 http://michael.otacoo.com/postgresql-2/postgres-9-4-feature-highlight-dynamic-background-workers/
+
+Installation
+============
+To install this extension you need to install the extension files first.
+
+To load the extension in the database do:
+
+	psql=> CREATE EXTENSION elephant_scheduler [WITH SCHEMA scheduler];
+	psql=> GRANT job_scheduler TO very_important_application;
+
+
+Usage
+=====
+To be able to use the scheduler you should be granted the `job_scheduler` role.
+
+The following views list the jobs you have permissions for:
+
+- `my_job` Will show only jobs which are owned by you
+- `member_job` Will show all the jobs owned by roles of which you are a member
+
+For the job logs you can use the views:
+
+- `my_job_log` Will show only job logs which are owned by you
+- `member_job_log` Will show all the job logs owned by roles of which you are a member
+
+For your convenenience a simple api is provided which will not require oids to schedule a job.
+Using the api is the preferred way of scheduling jobs.
+
+Defining a new job
+------------------
+
+	insert_job(job_command, datname, schedule, rolname, job_description, enabled, job_timeout, parallel);
+Examples:
+
+	SELECT insert_job('SELECT 1', current_catalog);
+	
+	SELECT *
+	  FROM insert_job(job_command := 'DELETE FROM order_archive WHERE o_closed < now() - interval '2 weeks'),
+					  datname 	  := 'weborder',
+				      schedule    := '{"@daily"}'
+					 );
+	
+Updating a job definition
+-------------------------
+
+	update_job(job_id, job_command, datname, schedule, rolname, job_description, enabled, job_timeout, parallel);
+`job_id` is mandatory, all other arguments are optional
+Examples:
+
+	SELECT update_job(1, job_description := 'Testing a job scheduler');
+	
+	SELECT * FROM update_job(10, enabled := false);
+
+Deleting a job definition
+-------------------------
+
+	delete_job(job_id);
+Examples:
+
+	SELECT * FROM delete_job(1);
+
+	SELECT delete(job_id)
+	  FROM my_job
+	 WHERE job_description = 'Temporary workaround';
