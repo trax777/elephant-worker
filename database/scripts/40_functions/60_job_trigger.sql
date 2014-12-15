@@ -3,15 +3,15 @@ $BODY$
 DECLARE
     schedule_length integer;
 BEGIN
-    IF NEW.useroid IS NULL
+    IF NEW.roloid IS NULL
     THEN
         SELECT oid
-          INTO NEW.useroid
+          INTO NEW.roloid
           FROM pg_catalog.pg_roles
          WHERE rolname=current_user;
     END IF;
 
-    IF NOT pg_catalog.pg_has_role(current_user, NEW.useroid, 'MEMBER')
+    IF NOT pg_catalog.pg_has_role(current_user, NEW.roloid, 'MEMBER')
     THEN
         RAISE SQLSTATE '42501' USING
         MESSAGE = 'Insufficient privileges',

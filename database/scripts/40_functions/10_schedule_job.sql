@@ -1,12 +1,12 @@
 CREATE FUNCTION @extschema@.insert_job(
         job_command text,
         datname name,
-        schedule text[] default null,
-        rolname name default current_user,
-        job_description text default null,
-        enabled boolean default true,
-        job_timeout interval default '6 hours',
-        parallel boolean default false)
+        schedule text[]         default null,
+        rolname name            default current_user,
+        job_description text    default null,
+        enabled boolean         default true,
+        job_timeout interval    default '6 hours',
+        parallel boolean        default false)
 RETURNS @extschema@.my_job
 LANGUAGE SQL
 AS
@@ -18,7 +18,7 @@ $BODY$
         enabled,
         job_timeout,
         parallel,
-        useroid,
+        roloid,
         datoid)
     VALUES (
         insert_job.job_command,
