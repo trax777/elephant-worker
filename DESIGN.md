@@ -5,45 +5,17 @@ This file is there to read design considerations and decisions.
 
 Job planning and execution: Security
 ====================================
-When we are going to run jobs on a schedule we will need a way to run the job
-in a secure way. Basically we want to make sure that someone will not be able
-to do something which he shouldn't be able to do.
-
-To safeguard against superuser exploits we decide to only allow security definer
-functions for the moment. This is because the job executor will probably have
-superuser rights.
+The worker process will attach to a database using a given username.
+We therefore will not do any permission checks, as the security context
+is the user's.
 
 To be able to schedule a job you must:
 - be member of the owner role of the function
 - have the job_scheduler role
 
-As there will be changes (transactions, ddl, dml) between the moment of
-defining a job and executing a job we must check all security related conditions during execution.
-Some example exploits are listed here:
-
-Example exploit 1
------------------
-Regular user joe:
-- creates a function: block_creditcard(customer_id integer), security definer
-- creates a scheduled job calling this function, this succeeds:
--- He owns the function
--- It is a security definer function
-
-Now the exploit:
-Joe drops his function. Another function with the same signature exists
-in the secure_creditcard schema. If this schema is in the search_path during execution,
-this function would be executed.
-
-Example exploit 2
------------------
-Regular user joe:
-- Creates a security definer function: pg_read_file(text) in schema joe.
-- Schedules all kinds of jobs with different file names:
--- pg_read_file('server.key')
--- pg_read_file('server.cert')
--- pg_read_file('certificate.private')
-- Drops his pg_read_file function
-- Examines the job log to see which one of these files exist
+We must however ensure that users cannot schedule jobs for roles which
+they are not a member of.
+We can enforce this using a check constraint on the job definition table.
 
 Job logging and reporting
 =========================
@@ -63,8 +35,11 @@ A simple security_barrier view could have the following WHERE clause:
 Capturing the output of the functions is out of scope: We may receive a huge
 amount of data which will be stored in scheduler tables/logs. This confuses matters.
 We leave it up to the writer of the jobs to store their output in their own tables.
-We do however return the number of rows affected, and if an error occurs, we will log
-as much information about the error as possible.
+
+We will try to capture something useful in case of failure.
+Logging to the server log can be done by the worker; but the worker may not be
+attached to the database containing the scheduler extension.
+It is therefore not for the worker to write into a log table but the launcher.
 
 Static resolving or dynamic resolving
 =====================================
@@ -77,17 +52,77 @@ We cannot however create foreign keys to the system tables, so that would be a b
 Or do we want to use dynamic resolving, which will survive a dump- and restore, which
 will honour search_path changes?
 
-We can also use intelligent dynamic resolving: during insert we check whether the function signature is valid,
-for example with a check ( function_signature::regprocedure::text = function_signature ) on the column, which
-will check the existence of the function during insert.
+We decide to use static resolving for database names and user names.
+The job_command will not be parsed or interpreted by the scheduler; it is therefore
+dynamically resolvable.
+
+Schema
+======
+The schema for this extension will exist in a single database, but it may serve all database in the cluster.
+
+A job has all kinds of attributes which must be reflected in the schema:
+
+- database oid to run the job on
+- user oid
+- a schedule
+- enabled yes/no
+- number of failures
+- number of successes
+- allowed to be run in parrallel
+- the command to execute
+- a comment or description
+- a timeout
+- when was it executed
+
+For the schedule we decide to implement the cron-style syntax:
+- it is understood by many
+- it makes transitioning jobs easy
+
+We may decide to add other styles in the future as well, we can think of:
+- one of jobs (think of linux atd for example)
+- interval schedule
+- sleep schedule
+
+Processes
+=========
+
+Launcher
+--------
+The launcher's task is to decide which job to execute at which given time.
+It will therefore periodically (every minute) scan the full job table to find jobs
+which have to run now. It can then launch workers which will process 1 job each.
+
+- check clock
+- for each job: check schedule
+- manage workers
+-- which are terminated
+-- check if scheduled job is still running
+-- check if job is not running longer than timeout
+
+Optional:
+- Shout on a LISTEN/NOTIFY channel when something happens
+
+If there are more jobs to run than there are worker processes available, we let postgres
+handle the problems for now.
+
+Worker
+------
+The worker will be given a row from the job table and attach to a given database using a given user.
+It will execute the provided command(s) and return success or a failure message.
+
+It may return a record containing useful information.
+
 
 DECISIONS TO MAKE
 =================
-- We will only accept security definer functions
+WONT: We will only accept security definer functions
+WONT: We will check whether the job to be executed is deemed safe
+WONT: These checks will be made during scheduling
+WONT: These checks will be made during executing
+WONT: We will capture the full output from the executed functions
 - Users can only schedule jobs which are owned by one of their roles
-- We will check whether the job to be executed is deemed safe
-- These checks will be made during scheduling
-- These checks will be made during executing
-- We will not capture the full output from the executed functions
 - We will use security barrier views to enable row level security
 - We will use "dynamic" resolving of function names and user names
+- We will have 1 database in the cluster which manages the jobs
+- We will have 1 set of processes in the cluster which will serve all databases
+- We will provide an api to schedule, remove or alter jobs

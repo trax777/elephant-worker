@@ -1,0 +1,4 @@
+relocatable = false
+superuser   = true
+comment 	= 'Job Scheduler using background workers'
+default_version = unstable
