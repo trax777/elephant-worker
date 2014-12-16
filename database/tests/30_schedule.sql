@@ -7,13 +7,4 @@ INSERT INTO :extschema.my_job (job_command, datoid, schedule) VALUES
 ('SELECT 1', :datoid, '*/12,*/11    0 * 1 0'),
 ('SELECT 1', :datoid, '*/12,30-40/3 0 * 11 0'),
 ('SELECT 1', :datoid, '@hourly'),
-
-
-
-
-
-
-
-
-
 ('SELECT 1', :datoid, '1-59/7 1 * 1 1');

@@ -1,14 +1,3 @@
--- multidimensional arrays must have array expressions with matching dimensions
--- For us this is a bit of a problem, as we would like to return an int[][] which "looks" as follows
--- for the cron entry:
---  1,2 3 4 2 0
---
---      minute    hour   dom    month   dow
----------------+-------+-----+--------+-----
---         1   |   3   |  4  |    2   |  0
---         2   |       |     |        |
---
--- We therefore decide to fill all parts of the array
 CREATE FUNCTION @extschema@.parse_cronfield (cronfield text, minvalue int, maxvalue int)
 RETURNS int []
 RETURNS NULL ON NULL INPUT
@@ -96,6 +85,17 @@ BEGIN
 
     -- Convert day 7 to day 0 (Sunday)
     dow :=  array(SELECT DISTINCT unnest(dow)%7 ORDER BY 1);
+
+    -- To model the logic of cron, we empty on of the dow or dom arrays
+    -- Logic (man 5 crontab):
+    -- If both fields are restricted (ie, are not *), the command will be run when
+    --     either field matches the current time.
+    IF entries[5] = '*' AND entries[3] != '*' THEN
+        dow := '{}'::int[];
+    END IF;
+    IF entries[3] = '*' AND entries[5] != '*' THEN
+        dom := '{}'::int[];
+    END IF;
 
     RETURN;
 END;

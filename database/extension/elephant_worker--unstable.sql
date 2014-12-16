@@ -157,17 +157,6 @@ COMMENT ON VIEW @extschema@.member_job_log IS
 GRANT SELECT, DELETE, INSERT, UPDATE ON @extschema@.my_job_log TO job_scheduler;
 GRANT SELECT, DELETE, INSERT, UPDATE ON @extschema@.member_job_log TO job_scheduler;
 GRANT SELECT ON @extschema@.job_log TO job_monitor;
--- multidimensional arrays must have array expressions with matching dimensions
--- For us this is a bit of a problem, as we would like to return an int[][] which "looks" as follows
--- for the cron entry:
---  1,2 3 4 2 0
---
---      minute    hour   dom    month   dow
----------------+-------+-----+--------+-----
---         1   |   3   |  4  |    2   |  0
---         2   |       |     |        |
---
--- We therefore decide to fill all parts of the array
 CREATE FUNCTION @extschema@.parse_cronfield (cronfield text, minvalue int, maxvalue int)
 RETURNS int []
 RETURNS NULL ON NULL INPUT
@@ -255,6 +244,17 @@ BEGIN
 
     -- Convert day 7 to day 0 (Sunday)
     dow :=  array(SELECT DISTINCT unnest(dow)%7 ORDER BY 1);
+
+    -- To model the logic of cron, we empty on of the dow or dom arrays
+    -- Logic (man 5 crontab):
+    -- If both fields are restricted (ie, are not *), the command will be run when
+    --     either field matches the current time.
+    IF entries[5] = '*' AND entries[3] != '*' THEN
+        dow := '{}'::int[];
+    END IF;
+    IF entries[3] = '*' AND entries[5] != '*' THEN
+        dom := '{}'::int[];
+    END IF;
 
     RETURN;
 END;
@@ -380,6 +380,37 @@ This trigger does not alter any data, it only validates.$$;
 
 CREATE TRIGGER validate_job_definition BEFORE INSERT OR UPDATE ON @extschema@.job
     FOR EACH ROW EXECUTE PROCEDURE @extschema@.validate_job_definition();
+CREATE FUNCTION @extschema@.job_scheduled_at(scheduled timestamptz default clock_timestamp())
+RETURNS SETOF @extschema@.my_job
+RETURNS NULL ON NULL INPUT
+LANGUAGE SQL
+AS
+$BODY$
+WITH time_elements (minute, hour, dom, month, dow) AS (
+        SELECT extract(minute from scheduled)::int,
+               extract(hour   from scheduled)::int,
+               extract(day    from scheduled)::int,
+               extract(month  from scheduled)::int,
+               extract(dow    from scheduled)::int
+    )
+SELECT job.*,
+       datname,
+       rolname
+  FROM @extschema@.job
+  JOIN pg_catalog.pg_roles pr    ON (job.roloid = pr.oid)
+  JOIN pg_catalog.pg_database pd ON (job.datoid = pd.oid)
+CROSS JOIN time_elements AS te
+ WHERE pg_has_role(session_user, roloid, 'MEMBER')
+   AND (parse_crontab(schedule)).minute @> ARRAY[te.minute]
+   AND (parse_crontab(schedule)).hour   @> ARRAY[te.hour]
+   AND (parse_crontab(schedule)).month  @> ARRAY[te.month]
+   AND (
+            (parse_crontab(schedule)).dom @> ARRAY[te.dom]
+            OR
+            (parse_crontab(schedule)).dow @> ARRAY[te.dow]
+       );
+$BODY$
+SECURITY DEFINER;
 DO
 $$
 DECLARE
