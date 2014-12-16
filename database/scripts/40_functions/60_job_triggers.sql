@@ -1,7 +1,5 @@
 CREATE FUNCTION @extschema@.validate_job_definition() RETURNS TRIGGER AS
 $BODY$
-DECLARE
-    schedule_length integer;
 BEGIN
     IF NEW.roloid IS NULL
     THEN
@@ -16,18 +14,6 @@ BEGIN
         RAISE SQLSTATE '42501' USING
         MESSAGE = 'Insufficient privileges',
         DETAIL  = format('You are not a member of role "%s"', user_name);
-    END IF;
-
-    schedule_length := array_length( NEW.schedule, 1 );
-    IF schedule_length <> 5
-    THEN
-        IF schedule_length <> 1
-        THEN
-            RAISE SQLSTATE '22023' USING
-            MESSAGE = 'Invalid crontab entry',
-            DETAIL  = format('You provided an array with %s elements, we require 1 or 5', schedule_length ),
-            HINT    = E'Use valid crontab syntax; for example:\n*/2 1,2,[4-8], * * *\n@monthly';
-        END IF;
     END IF;
 
     RETURN NEW;

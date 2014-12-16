@@ -1,8 +1,3 @@
-\set extname elephant_worker
-\set extschema scheduler
-\set dummy dummy
-drop extension if exists :extname cascade;
-create extension :extname with schema :extschema;
 SELECT oid AS datoid FROM pg_database WHERE datname=current_catalog;
 \gset
 INSERT INTO :extschema.my_job (job_command, datoid, schedule) VALUES

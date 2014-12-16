@@ -1,7 +1,7 @@
 CREATE FUNCTION @extschema@.insert_job(
         job_command text,
         datname name,
-        schedule text[]         default null,
+        schedule text           default null,
         rolname name            default current_user,
         job_description text    default null,
         enabled boolean         default true,

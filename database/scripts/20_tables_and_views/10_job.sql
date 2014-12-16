@@ -1,8 +1,8 @@
 CREATE TABLE @extschema@.job (
     job_id              serial primary key,
     datoid              oid not null,
-    roloid             oid not null,
-    schedule            text [],
+    roloid              oid not null,
+    schedule            text,
     enabled             boolean not null default true,
     failure_count       integer not null default 0 check ( failure_count>=0 ),
     success_count       integer not null default 0 check ( success_count>=0 ),
@@ -10,10 +10,9 @@ CREATE TABLE @extschema@.job (
     job_command         text not null,
     job_description     text,
     job_timeout         interval not null default '6 hours'::interval,
-    last_executed       timestamptz,
-    check ( schedule IS NULL OR array_length(schedule, 1) = 5)
+    last_executed       timestamptz
 );
-CREATE UNIQUE INDEX job_unique_definition_and_schedule ON @extschema@.job(datoid, roloid, coalesce(schedule,'{}'::text[]), job_command);
+CREATE UNIQUE INDEX job_unique_definition_and_schedule ON @extschema@.job(datoid, roloid, coalesce(schedule,''::text), job_command);
 COMMENT ON TABLE @extschema@.job IS
 'This table holds all the job definitions.';
 SELECT pg_catalog.pg_extension_config_dump('job', '');

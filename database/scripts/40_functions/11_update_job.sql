@@ -2,7 +2,7 @@ CREATE FUNCTION @extschema@.update_job(
 		job_id integer,
         job_command text default null,
         datname name default null,
-        schedule text[] default null,
+        schedule text default null,
         rolname name default null,
         job_description text default null,
         enabled boolean default null,
