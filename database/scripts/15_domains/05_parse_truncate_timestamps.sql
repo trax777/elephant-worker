@@ -1,4 +1,4 @@
-CREATE FUNCTION @extschema@.parse_timestamps(schedule text)
+CREATE FUNCTION @extschema@.parse_truncate_timestamps(schedule text)
 RETURNS text[]
 RETURNS null ON null input
 LANGUAGE plpgsql
@@ -32,3 +32,10 @@ $BODY$
 IMMUTABLE
 SECURITY INVOKER
 COST 10;
+
+COMMENT ON FUNCTION @extschema@.parse_truncate_timestamps(text) IS
+'Parses the provided schedule into a text[] of UTC timestamps.
+
+Truncates given timestamp(s) on the minute.
+
+Useful as a structure for indexing.';

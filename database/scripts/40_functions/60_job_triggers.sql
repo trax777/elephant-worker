@@ -18,12 +18,12 @@ BEGIN
 
     IF NEW.schedule IS NOT NULL AND @extschema@.parse_crontab(NEW.schedule) IS NULL THEN
         -- We convert the user provided timestamps into 'YYYY-MM-DD HH24:MI OF'
-        NEW.schedule := @extschema@.parse_timestamps(NEW.schedule);
+        NEW.schedule := @extschema@.parse_truncate_timestamps(NEW.schedule);
 
         -- Special case: provided timestamp matches current moment, we bump it 1 minute, so
         -- it will be executed asap.
         IF NEW.schedule = to_char(clock_timestamp() at time zone 'utc', '{\"YYYY-MM-DD HH24:MI OF\"}') THEN
-            NEW.schedule := @extschema@.parse_timestamps((NEW.schedule::timestamptz + interval '1 minute')::text);
+            NEW.schedule := @extschema@.parse_truncate_timestamps((NEW.schedule::timestamptz + interval '1 minute')::text);
         END IF;
     END IF;
 
