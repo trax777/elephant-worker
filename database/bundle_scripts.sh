@@ -1,6 +1,7 @@
 #!/bin/bash
 
 EXTNAME="elephant_worker"
+EXTSCHEMA="scheduler"
 
 
 BINDIR=$(dirname "$0")
@@ -34,6 +35,7 @@ __EOF__
 PREFILE="${BINDIR}/tests/00_environment.sql"
 cat > "${PREFILE}" <<__EOT__
 \set extname ${EXTNAME}
+\set extschema ${EXTSCHEMA}
 __EOT__
 
 cat "${BINDIR}/tests/environment" >> "${PREFILE}"
