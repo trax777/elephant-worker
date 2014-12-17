@@ -28,6 +28,7 @@ BEGIN
                 OR
                 (parse_crontab(schedule)).dow @> dow
            )
+       AND enabled = true
 
     UNION
 
@@ -38,7 +39,8 @@ BEGIN
       JOIN pg_catalog.pg_roles    pr ON (job.roloid = pr.oid)
       JOIN pg_catalog.pg_database pd ON (job.datoid = pd.oid)
      WHERE pg_has_role(session_user, roloid, 'MEMBER')
-       AND parse_timestamps(schedule) @> utc_string;
+       AND parse_timestamps(schedule) @> utc_string
+       AND enabled = true;
 END;
 $BODY$
 SECURITY DEFINER

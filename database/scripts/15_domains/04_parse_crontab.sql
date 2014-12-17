@@ -88,6 +88,16 @@ BEGIN
     month  := parse_cronfield(entries[4],1,12);
     dow    := parse_cronfield(entries[5],0,7);
 
+    -- if any entry is null, the crontab is invalid
+    IF minute IS NULL OR hour IS NULL OR month IS NULL OR dom IS NULL or dow IS NULL THEN
+        minute := null;
+        hour   := null;
+        month  := null;
+        dom    := null;
+        dow    := null;
+        RETURN;
+    END IF;
+
     -- Convert day 7 to day 0 (Sunday)
     dow :=  array(SELECT DISTINCT unnest(dow)%7 ORDER BY 1);
 
@@ -107,7 +117,3 @@ END;
 $BODY$
 SECURITY INVOKER
 IMMUTABLE;
-
-CREATE INDEX crontab_minute ON @extschema@.job USING GIN (((parse_crontab(schedule)).minute)) WHERE (parse_crontab(schedule)).minute IS NOT NULL;
-CREATE INDEX crontab_hour ON @extschema@.job USING GIN (((parse_crontab(schedule)).hour)) WHERE (parse_crontab(schedule)).hour IS NOT NULL;
-CREATE INDEX crontab_dom ON @extschema@.job USING GIN (((parse_crontab(schedule)).dom)) WHERE (parse_crontab(schedule)).dom IS NOT NULL;

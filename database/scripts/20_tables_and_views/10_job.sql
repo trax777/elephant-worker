@@ -2,7 +2,7 @@ CREATE TABLE @extschema@.job (
     job_id              serial primary key,
     datoid              oid not null,
     roloid              oid not null,
-    schedule            text,
+    schedule            @extschema@.schedule,
     enabled             boolean not null default true,
     failure_count       integer not null default 0 check ( failure_count>=0 ),
     success_count       integer not null default 0 check ( success_count>=0 ),
@@ -14,7 +14,10 @@ CREATE TABLE @extschema@.job (
 );
 CREATE UNIQUE INDEX job_unique_definition_and_schedule ON @extschema@.job(datoid, roloid, coalesce(schedule,''::text), job_command);
 COMMENT ON TABLE @extschema@.job IS
-'This table holds all the job definitions.';
+'This table holds all the job definitions.
+
+The schedule indexes on this table are used to
+quickly identify which jobs should be running on a specific moment.';
 SELECT pg_catalog.pg_extension_config_dump('job', '');
 
 
@@ -54,7 +57,7 @@ BEGIN
             COMMENT ON COLUMN %1$I.%2$I.roloid IS
                     'The oid of the user who should run this job.';
             COMMENT ON COLUMN %1$I.%2$I.schedule IS
-                    E'The schedule for this job. Allowed values are: \n- crontabs ("0 * 4-24/7 * *", "@daily")\n- (array of) timestamp ("now()", ''{"2031-12-22 14:12", "tomorrow"}'')\nThe timezone of the PostgreSQL cluster will be used to resolve the crontab, also\nThe granularity is 1 minute.';
+                    E'The schedule for this job, Hint: \\dD+ @extschema@.schedule';
             COMMENT ON COLUMN %1$I.%2$I.enabled IS
                     'Whether or not this job is enabled';
             COMMENT ON COLUMN %1$I.%2$I.failure_count IS
@@ -95,3 +98,8 @@ $$;
 GRANT SELECT, DELETE, INSERT, UPDATE ON @extschema@.my_job TO job_scheduler;
 GRANT SELECT, DELETE, INSERT, UPDATE ON @extschema@.member_job TO job_scheduler;
 GRANT SELECT ON @extschema@.job TO job_monitor;
+
+CREATE INDEX schedule_crontab_minute ON @extschema@.job USING GIN (((parse_crontab(schedule)).minute)) WHERE (parse_crontab(schedule)).minute IS NOT NULL;
+CREATE INDEX schedule_crontab_hour ON @extschema@.job USING GIN (((parse_crontab(schedule)).hour)) WHERE (parse_crontab(schedule)).hour IS NOT NULL;
+CREATE INDEX schedule_crontab_dom ON @extschema@.job USING GIN (((parse_crontab(schedule)).dom)) WHERE (parse_crontab(schedule)).dom IS NOT NULL;
+CREATE INDEX schedule_timestamps ON @extschema@.job USING GIN (parse_timestamps(schedule)) WHERE parse_timestamps(schedule) IS NOT NULL;

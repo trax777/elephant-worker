@@ -16,18 +16,14 @@ BEGIN
         DETAIL  = format('You are not a member of role "%s"', user_name);
     END IF;
 
-    -- We allow crontabs, and arrays of timestamps
-    -- If we cannot parse it as a crontab entry, we try to create an
-    -- array of timestamps at time zone utc from the input
-    IF NEW.schedule IS NOT NULL THEN
-        IF @extschema@.parse_crontab(NEW.schedule) IS NULL
-        THEN
-            NEW.schedule := @extschema@.parse_timestamps(NEW.schedule);
-            IF NEW.schedule IS NULL THEN
-                RAISE SQLSTATE '22023' USING
-                MESSAGE = 'Invalid schedule',
-                DETAIL  = format('Not a valid schedule expression');
-            END IF;
+    IF NEW.schedule IS NOT NULL AND @extschema@.parse_crontab(NEW.schedule) IS NULL THEN
+        -- We convert the user provided timestamps into 'YYYY-MM-DD HH24:MI OF'
+        NEW.schedule := @extschema@.parse_timestamps(NEW.schedule);
+
+        -- Special case: provided timestamp matches current moment, we bump it 1 minute, so
+        -- it will be executed asap.
+        IF NEW.schedule = to_char(clock_timestamp() at time zone 'utc', '{\"YYYY-MM-DD HH24:MI OF\"}') THEN
+            NEW.schedule := @extschema@.parse_timestamps((NEW.schedule::timestamptz + interval '1 minute')::text);
         END IF;
     END IF;
 
@@ -37,19 +33,14 @@ $BODY$
 LANGUAGE plpgsql;
 
 COMMENT ON FUNCTION @extschema@.validate_job_definition() IS
-$$We want to maintain some sanity on the @extschema@.job table. We could do this with check constraints, for example:
+$$We want to maintain some sanity on the @extschema@.job table.
 
- CONSTRAINT is_current_user_member_of_user_name  check ( pg_catalog.pg_has_role(current_user, user_name, 'MEMBER') ),
- CONSTRAINT does_function_exist                  check ( function_signature::regprocedure::text IS NOT NULL ),
- CONSTRAINT correct_number_of_function_arguments check ( array_length( string_to_array(function_signature::regprocedure::text, ','), 1 )
-                                                          =
-                                                          array_length( function_arguments, 1) )
-However, these check constraints will always be evaluated, even if we want to disable a job for example (because it cannot be resolved during runtime).
-We also do not wish to have a foreign key relation with the system catalogs (if it were possible).
-But we want to temporary disable a job which is temporarily invalid. Therefore we use a trigger to enforce the sanity of this table.
+Many checks are taken care of by check constraints
+(on the @extschema@.schedule DOMAIN, and the @extschema@.job TABLE).
 
-We also convert scheduler entries if needed.
-This trigger does not alter any data, it only validates.$$;
+We do some extra checks here and if a schedule consisting of timestamps is provided
+we convert it into timestaps at utc with a granularity of 1 minute.
+$$;
 
 CREATE TRIGGER validate_job_definition BEFORE INSERT OR UPDATE ON @extschema@.job
     FOR EACH ROW EXECUTE PROCEDURE @extschema@.validate_job_definition();
