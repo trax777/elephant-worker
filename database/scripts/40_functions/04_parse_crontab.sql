@@ -13,6 +13,7 @@ DECLARE
     min int;
     max int;
     step int;
+    result int[];
 BEGIN
     FOREACH entry IN ARRAY string_to_array(cronfield, ',')
     LOOP
@@ -36,7 +37,12 @@ BEGIN
         cronvalues := cronvalues || array(SELECT generate_series(min, max, step));
     END LOOP;
 
-    RETURN array(SELECT DISTINCT * FROM unnest(cronvalues) ORDER BY 1);
+    result := array(SELECT DISTINCT * FROM unnest(cronvalues) ORDER BY 1);
+    IF result = '{}'::int[] THEN
+        RETURN null;
+    END IF;
+
+    RETURN result;
 END;
 $BODY$
 SECURITY INVOKER
@@ -53,6 +59,7 @@ $BODY$
 DECLARE
     entries text [] := regexp_split_to_array(schedule, '\s+');
     entry   text;
+    empty int[] := '{}'::int[];
 BEGIN
     -- Allow some named entries, we transform them into the documented equivalent
     IF array_length (entries, 1) <> 5 THEN
@@ -68,15 +75,13 @@ BEGIN
             ELSIF entries[1] = '@hourly' THEN
                 entries := ARRAY['0','*','*','*','*'];
             ELSE
-                RETURN;
+                RETURN ;
             END IF;
         ELSE
             RETURN;
         END IF;
     END IF;
 
-    -- multidimensional arrays must have array expressions with matching dimensions
-    -- For us this is a bit of a problem
     minute := parse_cronfield(entries[1],0,59);
     hour   := parse_cronfield(entries[2],0,23);
     dom    := parse_cronfield(entries[3],1,31);
@@ -103,12 +108,6 @@ $BODY$
 SECURITY INVOKER
 IMMUTABLE;
 
-ALTER TABLE @extschema@.job ADD CONSTRAINT is_valid_crontab CHECK (
-    @extschema@.parse_crontab(schedule) IS NOT NULL
-);
-
-CREATE INDEX crontab_minute ON @extschema@.job USING GIN (((parse_crontab(schedule)).minute));
-CREATE INDEX crontab_hour   ON @extschema@.job USING GIN (((parse_crontab(schedule)).hour));
-CREATE INDEX crontab_dow    ON @extschema@.job USING GIN (((parse_crontab(schedule)).dow));
-CREATE INDEX crontab_month  ON @extschema@.job USING GIN (((parse_crontab(schedule)).month));
-CREATE INDEX crontab_dom    ON @extschema@.job USING GIN (((parse_crontab(schedule)).dom));
+CREATE INDEX crontab_minute ON @extschema@.job USING GIN (((parse_crontab(schedule)).minute)) WHERE (parse_crontab(schedule)).minute IS NOT NULL;
+CREATE INDEX crontab_hour ON @extschema@.job USING GIN (((parse_crontab(schedule)).hour)) WHERE (parse_crontab(schedule)).hour IS NOT NULL;
+CREATE INDEX crontab_dom ON @extschema@.job USING GIN (((parse_crontab(schedule)).dom)) WHERE (parse_crontab(schedule)).dom IS NOT NULL;

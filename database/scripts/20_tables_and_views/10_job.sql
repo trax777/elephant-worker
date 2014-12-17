@@ -54,7 +54,7 @@ BEGIN
             COMMENT ON COLUMN %1$I.%2$I.roloid IS
                     'The oid of the user who should run this job.';
             COMMENT ON COLUMN %1$I.%2$I.schedule IS
-                    'The schedule for this job. For now a subset of crontab like syntax is allowed.';
+                    E'The schedule for this job. Allowed values are: \n- crontabs ("0 * 4-24/7 * *", "@daily")\n- (array of) timestamp ("now()", ''{"2031-12-22 14:12", "tomorrow"}'')\nThe timezone of the PostgreSQL cluster will be used to resolve the crontab, also\nThe granularity is 1 minute.';
             COMMENT ON COLUMN %1$I.%2$I.enabled IS
                     'Whether or not this job is enabled';
             COMMENT ON COLUMN %1$I.%2$I.failure_count IS

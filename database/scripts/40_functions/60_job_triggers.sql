@@ -16,6 +16,21 @@ BEGIN
         DETAIL  = format('You are not a member of role "%s"', user_name);
     END IF;
 
+    -- We allow crontabs, and arrays of timestamps
+    -- If we cannot parse it as a crontab entry, we try to create an
+    -- array of timestamps at time zone utc from the input
+    IF NEW.schedule IS NOT NULL THEN
+        IF @extschema@.parse_crontab(NEW.schedule) IS NULL
+        THEN
+            NEW.schedule := @extschema@.parse_timestamps(NEW.schedule);
+            IF NEW.schedule IS NULL THEN
+                RAISE SQLSTATE '22023' USING
+                MESSAGE = 'Invalid schedule',
+                DETAIL  = format('Not a valid schedule expression');
+            END IF;
+        END IF;
+    END IF;
+
     RETURN NEW;
 END;
 $BODY$

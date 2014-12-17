@@ -73,7 +73,7 @@ BEGIN
             COMMENT ON COLUMN %1$I.%2$I.roloid IS
                     'The oid of the user who should run this job.';
             COMMENT ON COLUMN %1$I.%2$I.schedule IS
-                    'The schedule for this job. For now a subset of crontab like syntax is allowed.';
+                    E'The schedule for this job. Allowed values are: \n- crontabs ("0 * 4-24/7 * *", "@daily")\n- (array of) timestamp ("now()", ''{"2031-12-22 14:12", "tomorrow"}'')\nThe timezone of the PostgreSQL cluster will be used to resolve the crontab, also\nThe granularity is 1 minute.';
             COMMENT ON COLUMN %1$I.%2$I.enabled IS
                     'Whether or not this job is enabled';
             COMMENT ON COLUMN %1$I.%2$I.failure_count IS
@@ -172,6 +172,7 @@ DECLARE
     min int;
     max int;
     step int;
+    result int[];
 BEGIN
     FOREACH entry IN ARRAY string_to_array(cronfield, ',')
     LOOP
@@ -195,7 +196,12 @@ BEGIN
         cronvalues := cronvalues || array(SELECT generate_series(min, max, step));
     END LOOP;
 
-    RETURN array(SELECT DISTINCT * FROM unnest(cronvalues) ORDER BY 1);
+    result := array(SELECT DISTINCT * FROM unnest(cronvalues) ORDER BY 1);
+    IF result = '{}'::int[] THEN
+        RETURN null;
+    END IF;
+
+    RETURN result;
 END;
 $BODY$
 SECURITY INVOKER
@@ -212,6 +218,7 @@ $BODY$
 DECLARE
     entries text [] := regexp_split_to_array(schedule, '\s+');
     entry   text;
+    empty int[] := '{}'::int[];
 BEGIN
     -- Allow some named entries, we transform them into the documented equivalent
     IF array_length (entries, 1) <> 5 THEN
@@ -227,15 +234,13 @@ BEGIN
             ELSIF entries[1] = '@hourly' THEN
                 entries := ARRAY['0','*','*','*','*'];
             ELSE
-                RETURN;
+                RETURN ;
             END IF;
         ELSE
             RETURN;
         END IF;
     END IF;
 
-    -- multidimensional arrays must have array expressions with matching dimensions
-    -- For us this is a bit of a problem
     minute := parse_cronfield(entries[1],0,59);
     hour   := parse_cronfield(entries[2],0,23);
     dom    := parse_cronfield(entries[3],1,31);
@@ -262,15 +267,62 @@ $BODY$
 SECURITY INVOKER
 IMMUTABLE;
 
-ALTER TABLE @extschema@.job ADD CONSTRAINT is_valid_crontab CHECK (
+CREATE INDEX crontab_minute ON @extschema@.job USING GIN (((parse_crontab(schedule)).minute)) WHERE (parse_crontab(schedule)).minute IS NOT NULL;
+CREATE INDEX crontab_hour ON @extschema@.job USING GIN (((parse_crontab(schedule)).hour)) WHERE (parse_crontab(schedule)).hour IS NOT NULL;
+CREATE INDEX crontab_dom ON @extschema@.job USING GIN (((parse_crontab(schedule)).dom)) WHERE (parse_crontab(schedule)).dom IS NOT NULL;
+CREATE FUNCTION @extschema@.parse_timestamps(schedule text)
+RETURNS text[]
+RETURNS null ON null input
+LANGUAGE plpgsql
+AS
+$BODY$
+DECLARE
+    utc_times timestamptz[];
+    utc_strings text[];
+BEGIN
+    -- If this already is a valid crontab, do nothing
+    IF (@extschema@.parse_crontab(schedule)).minute IS NOT NULL THEN
+        RETURN null;
+    END IF;
+
+    BEGIN
+        utc_times := ARRAY[schedule::timestamptz at time zone 'utc'];
+        -- If only 1 time was specified which is very close to the current timestamp, we bump it with 1 minute
+        -- This will ensure people can schedule tasks using "now()" and clock_timestamp, it will then start
+        -- the next minute
+        IF extract(epoch FROM clock_timestamp() at time zone 'utc' - utc_times[1]) < 0.3 THEN
+            utc_times[1] := utc_times[1] + interval '1 minute';
+        END IF;
+    EXCEPTION
+        WHEN invalid_datetime_format THEN
+            BEGIN
+                utc_times := schedule::timestamptz[];
+            EXCEPTION
+                WHEN others THEN
+                    -- This parse failed, this means it is not a valid (array of) timestamps
+                    -- but it is not an error
+                    RETURN null;
+            END;
+    END;
+
+    -- Convert the timestamp to utc, convert to string
+    utc_strings := array( SELECT to_char(unnest at time zone 'utc', 'YYYY-MM-DD HH24:MI OF')
+                            FROM unnest(utc_times)
+                        ORDER BY 1);
+    RETURN utc_strings;
+END;
+$BODY$
+IMMUTABLE
+SECURITY INVOKER
+COST 10;
+
+ALTER TABLE @extschema@.job ADD CONSTRAINT is_valid_schedule CHECK (
     @extschema@.parse_crontab(schedule) IS NOT NULL
+    OR
+    @extschema@.parse_timestamps(schedule) IS NOT NULL
 );
 
-CREATE INDEX crontab_minute ON @extschema@.job USING GIN (((parse_crontab(schedule)).minute));
-CREATE INDEX crontab_hour   ON @extschema@.job USING GIN (((parse_crontab(schedule)).hour));
-CREATE INDEX crontab_dow    ON @extschema@.job USING GIN (((parse_crontab(schedule)).dow));
-CREATE INDEX crontab_month  ON @extschema@.job USING GIN (((parse_crontab(schedule)).month));
-CREATE INDEX crontab_dom    ON @extschema@.job USING GIN (((parse_crontab(schedule)).dom));
+CREATE INDEX schedule_timestamps ON @extschema@.job USING GIN (parse_timestamps(schedule)) WHERE parse_timestamps(schedule) IS NOT NULL;
 CREATE FUNCTION @extschema@.insert_job(
         job_command text,
         datname name,
@@ -358,6 +410,21 @@ BEGIN
         DETAIL  = format('You are not a member of role "%s"', user_name);
     END IF;
 
+    -- We allow crontabs, and arrays of timestamps
+    -- If we cannot parse it as a crontab entry, we try to create an
+    -- array of timestamps at time zone utc from the input
+    IF NEW.schedule IS NOT NULL THEN
+        IF @extschema@.parse_crontab(NEW.schedule) IS NULL
+        THEN
+            NEW.schedule := @extschema@.parse_timestamps(NEW.schedule);
+            IF NEW.schedule IS NULL THEN
+                RAISE SQLSTATE '22023' USING
+                MESSAGE = 'Invalid schedule',
+                DETAIL  = format('Not a valid schedule expression');
+            END IF;
+        END IF;
+    END IF;
+
     RETURN NEW;
 END;
 $BODY$
@@ -383,34 +450,48 @@ CREATE TRIGGER validate_job_definition BEFORE INSERT OR UPDATE ON @extschema@.jo
 CREATE FUNCTION @extschema@.job_scheduled_at(scheduled timestamptz default clock_timestamp())
 RETURNS SETOF @extschema@.my_job
 RETURNS NULL ON NULL INPUT
-LANGUAGE SQL
+LANGUAGE plpgsql
 AS
 $BODY$
-WITH time_elements (minute, hour, dom, month, dow) AS (
-        SELECT extract(minute from scheduled)::int,
-               extract(hour   from scheduled)::int,
-               extract(day    from scheduled)::int,
-               extract(month  from scheduled)::int,
-               extract(dow    from scheduled)::int
-    )
-SELECT job.*,
-       datname,
-       rolname
-  FROM @extschema@.job
-  JOIN pg_catalog.pg_roles pr    ON (job.roloid = pr.oid)
-  JOIN pg_catalog.pg_database pd ON (job.datoid = pd.oid)
-CROSS JOIN time_elements AS te
- WHERE pg_has_role(session_user, roloid, 'MEMBER')
-   AND (parse_crontab(schedule)).minute @> ARRAY[te.minute]
-   AND (parse_crontab(schedule)).hour   @> ARRAY[te.hour]
-   AND (parse_crontab(schedule)).month  @> ARRAY[te.month]
-   AND (
-            (parse_crontab(schedule)).dom @> ARRAY[te.dom]
-            OR
-            (parse_crontab(schedule)).dow @> ARRAY[te.dow]
-       );
+DECLARE
+    minute      int[] := ARRAY[extract(minute from scheduled)::int];
+    hour        int[] := ARRAY[extract(hour   from scheduled)::int];
+    month       int[] := ARRAY[extract(month  from scheduled)::int];
+    dom         int[] := ARRAY[extract(day    from scheduled)::int];
+    dow         int[] := ARRAY[extract(dow    from scheduled)::int];
+    utc_string text[] := ARRAY[to_char(scheduled at time zone 'utc', 'YYYY-MM-DD HH24:MI OF')];
+BEGIN
+    RETURN QUERY
+    SELECT job.*,
+           datname,
+           rolname
+      FROM @extschema@.job
+      JOIN pg_catalog.pg_roles    pr ON (job.roloid = pr.oid)
+      JOIN pg_catalog.pg_database pd ON (job.datoid = pd.oid)
+     WHERE pg_has_role(session_user, roloid, 'MEMBER')
+       AND (parse_crontab(schedule)).minute @> minute
+       AND (parse_crontab(schedule)).hour   @> hour
+       AND (parse_crontab(schedule)).month  @> month
+       AND (
+                (parse_crontab(schedule)).dom @> dom
+                OR
+                (parse_crontab(schedule)).dow @> dow
+           )
+
+    UNION
+
+    SELECT job.*,
+           datname,
+           rolname
+      FROM @extschema@.job
+      JOIN pg_catalog.pg_roles    pr ON (job.roloid = pr.oid)
+      JOIN pg_catalog.pg_database pd ON (job.datoid = pd.oid)
+     WHERE pg_has_role(session_user, roloid, 'MEMBER')
+       AND parse_timestamps(schedule) @> utc_string;
+END;
 $BODY$
-SECURITY DEFINER;
+SECURITY DEFINER
+ROWS 3;
 DO
 $$
 DECLARE

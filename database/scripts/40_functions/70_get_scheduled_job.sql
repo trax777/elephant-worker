@@ -12,7 +12,6 @@ DECLARE
     dow         int[] := ARRAY[extract(dow    from scheduled)::int];
     utc_string text[] := ARRAY[to_char(scheduled at time zone 'utc', 'YYYY-MM-DD HH24:MI OF')];
 BEGIN
-    RAISE NOTICE '%', utc_string;
     RETURN QUERY
     SELECT job.*,
            datname,
