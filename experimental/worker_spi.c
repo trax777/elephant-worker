@@ -38,13 +38,22 @@
 #include "lib/stringinfo.h"
 #include "nodes/pg_list.h"
 #include "pgstat.h"
+#include "storage/dsm.h"
+#include "storage/shm_toc.h"
+#include "storage/spin.h"
 #include "utils/builtins.h"
 #include "utils/snapmgr.h"
+#include "utils/resowner_private.h"
 #include "tcop/utility.h"
 
 PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(worker_spi_launch);
+
+/* Identifier for shared memory segments used by this extension */
+#define WORKER_SPI_SHM_MAGIC 	0x9fa529e1
+/* Maximum length of the error message */
+#define MAX_ERROR_MESSAGE_LEN 	1024
 
 void		_PG_init(void);
 void		worker_spi_main(Datum) __attribute__((noreturn));
@@ -58,6 +67,9 @@ static volatile sig_atomic_t got_sigusr1 = false;
 static int	worker_spi_naptime = 10;
 static int	worker_spi_total_workers = 2;
 static int  launcher_spi_naptime = 500;
+static int launcher_max_workers = 5;
+/* whether we were run by the launcher and not directly by the user */
+static bool LauncherChild = false;
 
 
 typedef struct worktable
@@ -66,19 +78,209 @@ typedef struct worktable
 	const char *name;
 } worktable;
 
-/* The first 2 fields of this structure are non-shared. The last one represents
- * a shared message queue we use to pass information from the child processes
- * to the launcher.
- */
-typedef struct WorkerData
+typedef struct
 {
-	pid_d 	pid;
-	BackgroundWorkerHandle *handle;
+	slock_t		mutex;
+	uint32 	slotno;
+	uint32 	index;
+	bool  	consumed;
+} WorkerCallHeader;
+
+
+/*
+ * A worker should communicate to us about the exit status, SQL state and the
+ * error message in case an error occured. For this, we could use a queue, but
+ * that would involve dealing with quite complex and poorly documented shm_mq
+ * data structure. Instead, we can use a single array of char per each worker,
+ * keeping track of the error code, SQL state and the error message. 
+ * We don't need to deal with locks, since only worker is supposed to write to
+ * the array and only launcher will read from it, and only when it knows that
+ * the worker has already terminated, thus, no given processes will read the
+ * data from it simultaneously.
+ */
+typedef struct
+{
+	int 	workers_total;
+	int 	workers_active;
+	dsm_segment   *data;
+	shm_toc 	  *toc;
+	WorkerCallHeader *hdr;
+	BackgroundWorkerHandle *worker_handles[FLEXIBLE_ARRAY_MEMBER];
+} LauncherState;
+
+static LauncherState   *launcher;
+
+/*
+ * Each background worker can propagate its exitcode, sqlstate and errormessage.
+ * The launcher will read the slot only if the contents is not consimed, setting
+ * the consumed flag right after it. The worker will reset the consumed flag
+ * upon writing to the slot.
+ */
+typedef struct
+{
+	bool 	consumed;
+	int 	exitcode;
+	int 	sqlstate;
+	char 	errormessage[MAX_ERROR_MESSAGE_LEN];
+} WorkerState;
+
+/* Feedback data area per each worker to return sql codes and error messages to the launcher */
+static WorkerState  *worker;
+
+/* Forward static declarations */
+static LauncherState *setup_launcher(dsm_segment *seg, shm_toc *toc, WorkerCallHeader *hdr, int nworkers);
+static bool launch_workers(int count, int *indexes);
+static void terminate_workers();
+static void cleanup_on_workers_exit();
+static BackgroundWorkerHandle *worker_spi_launch_internal(uint32 segment, int index, pid_t *retpid);
+
+/*
+ * Setup the shared memory segment. Creates toc and allocates nworkers * worker states
+ */
+static void
+setup_dynamic_shared_memory(int nworkers)
+{
+	shm_toc_estimator e;
+	int 			i;
+	dsm_segment    *seg;
+	shm_toc  	   *toc;
+	WorkerCallHeader *hdr;
+	WorkerState *ptr;
+
+	Size 			segsize;
+	Size 			data_size = sizeof(WorkerState);
+	Size 			header_size = sizeof(WorkerCallHeader);
+
+	/* Estimate how much shared memory we need */
+
+	shm_toc_initialize_estimator(&e);
+
+	/* Because the TOC machinery may choose to insert padding of oddly-sized
+	 * requests we must estimate each chunk separately. We need to register
+	 * nworkers keys to track the same number of shared segments.
+	 */
+	shm_toc_estimate_chunk(&e, header_size);
+	for (i = 0; i < nworkers; i++)
+		shm_toc_estimate_chunk(&e, data_size);
+
+	shm_toc_estimate_keys(&e, nworkers + 2);
+	segsize = shm_toc_estimate(&e);
+
+	CurrentResourceOwner = ResourceOwnerCreate(NULL, "spi_launcher");
+	/* Create the shared memory and establish a table of contents */
+	seg = dsm_create(segsize);
+	/* clear the memory, so that the consumed flag is set to false by default */
+	memset(dsm_segment_address(seg), 0, segsize);
+	toc = shm_toc_create(WORKER_SPI_SHM_MAGIC, dsm_segment_address(seg), segsize);
+	hdr = shm_toc_allocate(toc, header_size);
+	SpinLockInit(&hdr->mutex);
+	shm_toc_insert(toc, 0, hdr);
+	for (i = 1; i <= nworkers; i++)
+	{
+		/* allocate a space for a given slot */
+		ptr = shm_toc_allocate(toc, data_size);
+		shm_toc_insert(toc, i, ptr);
+	}
+	launcher = setup_launcher(seg, toc, hdr, nworkers);
 }
 
-static BackgroundWorkerHandle *
-worker_spi_launch_internal(int32 index, pid_t *retpid);
+/*
+ * Setup the initial worker state, no workers are active */
+static LauncherState *
+setup_launcher(dsm_segment *seg, shm_toc *toc, WorkerCallHeader *hdr, int nworkers)
+{
+	int 	i;
+	LauncherState *result = palloc(offsetof(LauncherState, worker_handles) +
+								 nworkers * sizeof(BackgroundWorkerHandle *));
+	result->workers_total = nworkers;
+	result->workers_active = 0;
+	result->data = seg;
+	result->hdr = hdr;
+	result->toc = toc;
+	for (i = 0; i < nworkers; i++)
+		result->worker_handles[i] = NULL;
+	return result;
+}
 
+/* Attach to the shared memory segment from the worker perspective */
+static void
+worker_attach_to_shared_memory(int segmentno, int *index)
+{
+	WorkerState    		 *result;
+	volatile WorkerCallHeader *hdr;
+	dsm_segment 		  *seg;
+	shm_toc 			  *toc;
+	int  				  slotno;
+
+	/* shared memory is not used in a stand-alone worker */
+	if (!LauncherChild)
+		return;
+
+	/* Connect to dynamic shared memory segment
+	 *
+	 * In order to attach a dynamic shared memory, we need a resource owner.
+	 * Once we've mapped the segment in our address space, attach to the table
+	 * of contents so we can locate the feedback data area within the segment.
+	 */
+	CurrentResourceOwner = ResourceOwnerCreate(NULL, "spi_worker");
+	seg = dsm_attach(segmentno);
+	if (seg == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("unable to map dynamic shared memory segment")));
+	toc = shm_toc_attach(WORKER_SPI_SHM_MAGIC, dsm_segment_address(seg));
+	if (toc == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("bad magic number in dynamic shared memory segment")));
+
+	hdr = shm_toc_lookup(toc, 0);
+	SpinLockAcquire(&hdr->mutex);
+	*index = hdr->index;
+	slotno = hdr->slotno;
+	hdr->consumed = true;
+	SpinLockRelease(&hdr->mutex);
+	elog(LOG, "attaching to shared memory segment: %d index: %d", segmentno, *index);
+	/* get our feedback data area */
+	result = shm_toc_lookup(toc, slotno + 1);
+	if (result == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("unable to fetch worker feedback state area from the dynamic shared memory segment")));
+	worker = result;
+	/*
+	 * Initialize the worker structure.
+	 * The state is set consumed, no news from the worker to the launcher at start.
+	 */
+	worker->consumed = true;
+	worker->exitcode = 0;
+	worker->sqlstate = 0;
+	worker->errormessage[0] = '\0';
+}
+
+static void
+worker_report_feedback(int exitcode, int sqlstate, char *msg)
+{
+	Assert(worker != NULL);
+	worker->consumed = false;
+	worker->exitcode = exitcode;
+	worker->sqlstate = sqlstate;
+	if (msg)
+		snprintf(worker->errormessage, MAX_ERROR_MESSAGE_LEN - 1, "%s", msg);
+}
+
+/* attach to the given slot and fetch the feedback from a worker */
+static WorkerState *
+get_worker(int slotno)
+{
+	Assert(launcher != NULL);
+	WorkerState *result = shm_toc_lookup(launcher->toc, slotno + 1);
+	if (result == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("unable to fetch worker feedback state area from the dynamic shared memory segment")));
+	return result;
+}
 
 /*
  * Signal handler for SIGTERM
@@ -170,6 +372,7 @@ launcher_spi_sigusr1(SIGNAL_ARGS)
  	char 		name[20];
  	int 	   *to_launch;
  	List 	   *worker_list = NIL;
+ 	dsm_segment *segment;
  	ListCell   *lc;
 
  	table = palloc(sizeof(worktable));
@@ -185,11 +388,14 @@ launcher_spi_sigusr1(SIGNAL_ARGS)
  	/* We are now ready to receive signals */
  	BackgroundWorkerUnblockSignals();
 
+ 	setup_dynamic_shared_memory(launcher_max_workers);
+
  	/* Connect to the postgres database as a superuser*/
  	BackgroundWorkerInitializeConnection("postgres", NULL);
 
  	elog(LOG, "%s initialized with %s.%s",
  		 MyBgworkerEntry->bgw_name, table->schema, table->name);
+ 	pgstat_report_appname(MyBgworkerEntry->bgw_name);
  	initialize_launcher_spi(table);
 
  	initStringInfo(&buf);
@@ -248,7 +454,7 @@ launcher_spi_sigusr1(SIGNAL_ARGS)
  		 	bool 		isnull;
  		 	int32 		val;
 
- 		 	to_launch = palloc(sizeof(int) * SPI_processed);
+ 		 	to_launch = SPI_palloc(sizeof(int) * SPI_processed);
 
  		 	for (i = 0; i < SPI_processed; i++)
  		 	{
@@ -268,71 +474,153 @@ launcher_spi_sigusr1(SIGNAL_ARGS)
  		  */
  		 processed = SPI_processed;
 
- 		 /*
- 		  * And finish our transaction
- 		  */
- 		  SPI_finish();
- 		  PopActiveSnapshot();
- 		  CommitTransactionCommand();
+ 		/*
+ 		 * And finish our transaction
+ 		 */
+ 		 SPI_finish();
+ 		 PopActiveSnapshot();
+ 		 CommitTransactionCommand();
+
+ 		 /* Check if we have to start new workers */
  		 if (processed == 0 && !got_sigusr1)
  		 {
  		 	pgstat_report_activity(STATE_IDLE, NULL);
  		  	continue;
  		 }
  		 /* Launch all new worker processes */
-		 for (i = 0; i < processed; i++)
-		 {
-		 	int 	index;
-		 	BackgroundWorkerHandle *handle;
-		 	index = to_launch[i];
-
+ 		 if (processed > 0)
+ 		 {
 		 	pgstat_report_activity(STATE_RUNNING, "launching child processes");
-		 	handle = worker_spi_launch_internal(index, NULL);
-		 	if (handle)
-		  		worker_list = lappend(worker_list, handle);
+		 	if (!launch_workers(processed, to_launch))
+		 		elog(WARNING, "unable to launch child processes: no available child slots");
+			pfree(to_launch);
 		 }
 		 if (got_sigusr1)
 		 {
 		 	got_sigusr1 = false;
 		 	/* recheck if we should remove some processes from the list */
-		 	List *new_list = NIL;
-
 		 	pgstat_report_activity(STATE_RUNNING, "removing stopped child processes");
-		 	foreach(lc, worker_list)
-		 	{
-		 		pid_t 	pid;
-		 		BgwHandleStatus status;
-		 		BackgroundWorkerHandle *worker = (BackgroundWorkerHandle *)lfirst(lc);
-		 		status = GetBackgroundWorkerPid(worker, &pid);
-		 		if (status == BGWH_STOPPED)
-		 			elog(LOG, "worker %d has stopped", pid);
-		 		else
-		 			new_list = lappend(new_list, worker);
-		 	}
-		 	list_free(worker_list);
-		 	worker_list = new_list;
+		 	cleanup_on_workers_exit();
 		 }
-		 pfree(to_launch);
 		 pgstat_report_activity(STATE_IDLE, NULL);
  	}
- 	foreach(lc, worker_list)
- 	{
- 		pid_t 	pid;
- 		BgwHandleStatus status;
- 		BackgroundWorkerHandle *worker = (BackgroundWorkerHandle *) lfirst(lc);
- 		status = GetBackgroundWorkerPid(worker, &pid);
- 		if (status == BGWH_STARTED)
- 		{
- 			elog(LOG, "terminating worker %d because of the launcher exit", pid);
- 			TerminateBackgroundWorker(worker);
- 		}
- 	}
+ 	terminate_workers();
+ 	cleanup_on_workers_exit();
+
  	/*
  	* Don't bother with freeing the memory for the workers list,
  	 * it will be all gone when we terminate the process
  	 */
  	proc_exit(1);
  }
+
+static void
+fill_launch_area(slotno, indexno)
+{
+	volatile WorkerCallHeader *hdr = launcher->hdr;
+	SpinLockAcquire(&hdr->mutex);
+	hdr->consumed = false;
+	hdr->slotno = slotno;
+	hdr->index = indexno;
+	SpinLockRelease(&hdr->mutex);
+}
+
+/* Launch given number of workers */
+static bool
+launch_workers(int count, int *indexes)
+{
+	int 	i;
+	int  	j = 0;
+	int 	t = 0;
+
+	if (launcher->workers_active + count > launcher->workers_total)
+		return false;
+
+	for (i = 0; i < count; i++)
+	{
+		while (j < launcher->workers_total)
+		{
+			if (launcher->worker_handles[j] == NULL)
+			{
+				pid_t 	pid;
+				bool 	consumed;
+				/* Use this slot and launch a new worker */
+				elog(LOG, "launching worker with index %d", indexes[i]);
+				fill_launch_area(j, indexes[i]);
+				BackgroundWorkerHandle   *handle = worker_spi_launch_internal(dsm_segment_handle(launcher->data), indexes[i], NULL);
+				volatile WorkerCallHeader *hdr = launcher->hdr;
+				/* Wait for the process to attach to shared memory */
+				for (t = 0; t < 5; t++)
+				{
+					SpinLockAcquire(&hdr->mutex);
+					consumed = hdr->consumed;
+					SpinLockRelease(&hdr->mutex);
+					if (consumed)
+						break;
+					/* XXX: this may loose signals and not-notice if the Postmaster dies */
+					pg_usleep(1000L);
+
+				}
+				if (!consumed)
+				{
+					elog(LOG, "timeout out waiting for backend with index %d to attach to shared memory", indexes[i]);
+					TerminateBackgroundWorker(launcher->worker_handles[i]);
+				}
+				else
+				{
+					launcher->worker_handles[j++] = handle;
+					launcher->workers_active++;
+					break;
+				}
+			}
+			j++;
+		}
+		if (j == launcher->workers_total)
+			return false;
+	}
+	return true;
+}
+
+static void
+cleanup_on_workers_exit()
+{
+	int 	i;
+	pid_t 	pid;
+
+	for (i = 0; i < launcher->workers_total; i++)
+	{
+		/* Check a given worker, free its slot if it has terminated and get its last will as well */
+		if (launcher->worker_handles[i] != NULL && GetBackgroundWorkerPid(launcher->worker_handles[i], &pid) != BGWH_STARTED)
+		{
+			WorkerState *state = get_worker(i);
+			if (!state->consumed)
+			{
+				elog(LOG, "worker %d has stopped", pid);
+				elog(LOG, "exit code: %d", state->exitcode);
+				elog(LOG, "SQL state: %s", unpack_sql_state(state->sqlstate));
+				elog(LOG, "last will: %s", state->errormessage);
+				launcher->worker_handles[i] = NULL;
+			}
+			launcher->workers_active--;
+		}
+	}
+}
+
+static void
+terminate_workers()
+{
+	int 	i;
+	pid_t 	pid;
+	for (i = 0; i < launcher->workers_total; i++)
+	{
+		if (launcher->worker_handles[i] != NULL)
+			if (GetBackgroundWorkerPid(launcher->worker_handles[i], &pid) == BGWH_STARTED)
+			{
+				elog(LOG, "terminating worker %d because of the launcher exit", pid);
+				TerminateBackgroundWorker(launcher->worker_handles[i]);
+			}
+	}
+}
 
 /*
  * Initialize workspace for a worker process: create the schema if it doesn't
@@ -400,15 +688,11 @@ initialize_worker_spi(worktable *table)
 void
 worker_spi_main(Datum main_arg)
 {
-	int			index = DatumGetInt32(main_arg);
+	int segment = UInt32GetDatum(main_arg);
 	worktable  *table;
 	StringInfoData buf;
+	int 		index;
 	char		name[20];
-
-	table = palloc(sizeof(worktable));
-	sprintf(name, "schema%d", index);
-	table->schema = pstrdup(name);
-	table->name = pstrdup("counted");
 
 	/* Establish signal handlers before unblocking signals. */
 	pqsignal(SIGHUP, worker_spi_sighup);
@@ -417,130 +701,162 @@ worker_spi_main(Datum main_arg)
 	/* We're now ready to receive signals */
 	BackgroundWorkerUnblockSignals();
 
-	/* Connect to our database */
-	BackgroundWorkerInitializeConnection("postgres", NULL);
-
-	elog(LOG, "%s initialized with %s.%s",
-		 MyBgworkerEntry->bgw_name, table->schema, table->name);
-	initialize_worker_spi(table);
-
-	/*
-	 * Quote identifiers passed to us.  Note that this must be done after
-	 * initialize_worker_spi, because that routine assumes the names are not
-	 * quoted.
-	 *
-	 * Note some memory might be leaked here.
-	 */
-	table->schema = quote_identifier(table->schema);
-	table->name = quote_identifier(table->name);
-
-	initStringInfo(&buf);
-	appendStringInfo(&buf,
-					 "WITH deleted AS (DELETE "
-					 "FROM %s.%s "
-					 "WHERE type = 'delta' RETURNING value), "
-					 "total AS (SELECT coalesce(sum(value), 0) as sum "
-					 "FROM deleted) "
-					 "UPDATE %s.%s "
-					 "SET value = %s.value + total.sum, "
-					 "last_modified = CASE WHEN total.sum != 0 THEN now() ELSE last_modified END "
-					 "FROM total WHERE type = 'total' "
-					 "RETURNING %s.value, %s.last_modified",
-					 table->schema, table->name,
-					 table->schema, table->name,
-					 table->name,
-					 table->name,
-					 table->name);
-
-	/*
-	 * Main loop: do this until the SIGTERM handler tells us to terminate
-	 */
-	while (!got_sigterm)
+	if (segment != 0)
 	{
-		int			ret;
-		int			rc;
-
-		/*
-		 * Background workers mustn't call usleep() or any direct equivalent:
-		 * instead, they may wait on their process latch, which sleeps as
-		 * necessary, but is awakened if postmaster dies.  That way the
-		 * background process goes away immediately in an emergency.
-		 */
-		rc = WaitLatch(&MyProc->procLatch,
-					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
-					   worker_spi_naptime * 1000L);
-		ResetLatch(&MyProc->procLatch);
-
-		/* emergency bailout if postmaster has died */
-		if (rc & WL_POSTMASTER_DEATH)
-			proc_exit(1);
-
-		/*
-		 * In case of a SIGHUP, just reload the configuration.
-		 */
-		if (got_sighup)
-		{
-			got_sighup = false;
-			ProcessConfigFile(PGC_SIGHUP);
-		}
-
-		/*
-		 * Start a transaction on which we can run queries.  Note that each
-		 * StartTransactionCommand() call should be preceded by a
-		 * SetCurrentStatementStartTimestamp() call, which sets both the time
-		 * for the statement we're about the run, and also the transaction
-		 * start time.  Also, each other query sent to SPI should probably be
-		 * preceded by SetCurrentStatementStartTimestamp(), so that statement
-		 * start time is always up to date.
-		 *
-		 * The SPI_connect() call lets us run queries through the SPI manager,
-		 * and the PushActiveSnapshot() call creates an "active" snapshot
-		 * which is necessary for queries to have MVCC data to work on.
-		 *
-		 * The pgstat_report_activity() call makes our activity visible
-		 * through the pgstat views.
-		 */
-		SetCurrentStatementStartTimestamp();
-		StartTransactionCommand();
-		SPI_connect();
-		PushActiveSnapshot(GetTransactionSnapshot());
-		pgstat_report_activity(STATE_RUNNING, buf.data);
-
-		/* We can now execute queries via SPI */
-		ret = SPI_execute(buf.data, false, 0);
-
-		if (ret != SPI_OK_UPDATE_RETURNING)
-			elog(FATAL, "cannot select from table %s.%s: error code %d",
-				 table->schema, table->name, ret);
-
-		if (SPI_processed > 0)
-		{
-			bool		isnull;
-			int32		val;
-			char       *modified;
-
-			val = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
-											  SPI_tuptable->tupdesc,
-											  1, &isnull));
-			modified = SPI_getvalue(SPI_tuptable->vals[0],
-									SPI_tuptable->tupdesc,
-									2);
-
-			if (!isnull)
-				elog(LOG, "%s: count in %s.%s is now %d, last_modified: %s",
-					 MyBgworkerEntry->bgw_name,
-					 table->schema, table->name,
-					 val, modified);
-		}
-
-		/*
-		 * And finish our transaction.
-		 */
-		SPI_finish();
-		PopActiveSnapshot();
-		CommitTransactionCommand();
-		pgstat_report_activity(STATE_IDLE, NULL);
+		LauncherChild = true;
+		worker_attach_to_shared_memory(segment, &index);
 	}
+	else
+	{
+		LauncherChild = false;
+		index = 0;
+	}
+
+	table = palloc(sizeof(worktable));
+	sprintf(name, "schema%d", index);
+	table->schema = pstrdup(name);
+	table->name = pstrdup("counted");
+
+	PG_TRY();
+	{
+		/* Connect to our database */
+		BackgroundWorkerInitializeConnection("postgres", NULL);
+
+		elog(LOG, "%s initialized with %s.%s",
+			 MyBgworkerEntry->bgw_name, table->schema, table->name);
+		pgstat_report_appname(MyBgworkerEntry->bgw_name);
+		initialize_worker_spi(table);
+
+		/*
+		 * Quote identifiers passed to us.  Note that this must be done after
+		 * initialize_worker_spi, because that routine assumes the names are not
+		 * quoted.
+		 *
+		 * Note some memory might be leaked here.
+		 */
+		table->schema = quote_identifier(table->schema);
+		table->name = quote_identifier(table->name);
+
+		initStringInfo(&buf);
+		appendStringInfo(&buf,
+						 "WITH deleted AS (DELETE "
+						 "FROM %s.%s "
+						 "WHERE type = 'delta' RETURNING value), "
+						 "total AS (SELECT coalesce(sum(value), 0) as sum "
+						 "FROM deleted) "
+						 "UPDATE %s.%s "
+						 "SET value = %s.value + total.sum, "
+						 "last_modified = CASE WHEN total.sum != 0 THEN now() ELSE last_modified END "
+						 "FROM total WHERE type = 'total' "
+						 "RETURNING %s.value, %s.last_modified",
+						 table->schema, table->name,
+						 table->schema, table->name,
+						 table->name,
+						 table->name,
+						 table->name);
+
+		/*
+		 * Main loop: do this until the SIGTERM handler tells us to terminate
+		 */
+		while (!got_sigterm)
+		{
+			int			ret;
+			int			rc;
+
+			/*
+			 * Background workers mustn't call usleep() or any direct equivalent:
+			 * instead, they may wait on their process latch, which sleeps as
+			 * necessary, but is awakened if postmaster dies.  That way the
+			 * background process goes away immediately in an emergency.
+			 */
+			rc = WaitLatch(&MyProc->procLatch,
+						   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
+						   worker_spi_naptime * 1000L);
+			ResetLatch(&MyProc->procLatch);
+
+			/* emergency bailout if postmaster has died */
+			if (rc & WL_POSTMASTER_DEATH)
+				proc_exit(1);
+
+			/*
+			 * In case of a SIGHUP, just reload the configuration.
+			 */
+			if (got_sighup)
+			{
+				got_sighup = false;
+				ProcessConfigFile(PGC_SIGHUP);
+			}
+
+			/*
+			 * Start a transaction on which we can run queries.  Note that each
+			 * StartTransactionCommand() call should be preceded by a
+			 * SetCurrentStatementStartTimestamp() call, which sets both the time
+			 * for the statement we're about the run, and also the transaction
+			 * start time.  Also, each other query sent to SPI should probably be
+			 * preceded by SetCurrentStatementStartTimestamp(), so that statement
+			 * start time is always up to date.
+			 *
+			 * The SPI_connect() call lets us run queries through the SPI manager,
+			 * and the PushActiveSnapshot() call creates an "active" snapshot
+			 * which is necessary for queries to have MVCC data to work on.
+			 *
+			 * The pgstat_report_activity() call makes our activity visible
+			 * through the pgstat views.
+			 */
+			SetCurrentStatementStartTimestamp();
+			StartTransactionCommand();
+			SPI_connect();
+			PushActiveSnapshot(GetTransactionSnapshot());
+			pgstat_report_activity(STATE_RUNNING, buf.data);
+
+			/* We can now execute queries via SPI */
+			ret = SPI_execute(buf.data, false, 0);
+
+			if (ret != SPI_OK_UPDATE_RETURNING)
+				elog(FATAL, "cannot select from table %s.%s: error code %d",
+					 table->schema, table->name, ret);
+
+			if (SPI_processed > 0)
+			{
+				bool		isnull;
+				int32		val;
+				char       *modified;
+
+				val = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
+												  SPI_tuptable->tupdesc,
+												  1, &isnull));
+				modified = SPI_getvalue(SPI_tuptable->vals[0],
+										SPI_tuptable->tupdesc,
+										2);
+
+				if (!isnull)
+					elog(LOG, "%s: count in %s.%s is now %d, last_modified: %s",
+						 MyBgworkerEntry->bgw_name,
+						 table->schema, table->name,
+						 val, modified);
+			}
+
+			/*
+			 * And finish our transaction.
+			 */
+			SPI_finish();
+			PopActiveSnapshot();
+			CommitTransactionCommand();
+			pgstat_report_activity(STATE_IDLE, NULL);
+		}
+	}
+	PG_CATCH();
+	{
+		if (LauncherChild)
+		{
+			ErrorData 	*errdata;
+			/* Save the error in shared memory */
+			errdata = CopyErrorData();
+			worker_report_feedback(errdata->saved_errno, errdata->sqlerrcode, errdata->message);
+		}
+	 	PG_RE_THROW();
+	}
+	PG_END_TRY();
 
 	proc_exit(1);
 }
@@ -599,6 +915,18 @@ _PG_init(void)
 						    NULL,
 						    NULL);
 
+	DefineCustomIntVariable("launcher_spi.max_workers",
+							"Maximum number of workers that can be launched dynammically.",
+							NULL,
+							&launcher_max_workers,
+							5,
+							1,
+							max_worker_processes - 1,
+							PGC_POSTMASTER,
+							0,
+							NULL,
+							NULL,
+							NULL);
 
 	/* set up common data for all our workers */
 	launcher.bgw_flags = BGWORKER_SHMEM_ACCESS |
@@ -617,7 +945,7 @@ _PG_init(void)
  * Dynamically launch an SPI worker.
  */
 static BackgroundWorkerHandle *
-worker_spi_launch_internal(int32 index, pid_t *retpid)
+worker_spi_launch_internal(uint32 segment, int index, pid_t *retpid)
 {
 	BackgroundWorker worker;
 	BackgroundWorkerHandle *handle;
@@ -632,7 +960,7 @@ worker_spi_launch_internal(int32 index, pid_t *retpid)
 	sprintf(worker.bgw_library_name, "worker_spi");
 	sprintf(worker.bgw_function_name, "worker_spi_main");
 	snprintf(worker.bgw_name, BGW_MAXLEN, "worker %d", index);
-	worker.bgw_main_arg = Int32GetDatum(index);
+	worker.bgw_main_arg = UInt32GetDatum(segment);
 	/* set bgw_notify_pid so that we can use WaitForBackgroundWorkerStartup */
 	worker.bgw_notify_pid = MyProcPid;
 
@@ -666,7 +994,7 @@ worker_spi_launch(PG_FUNCTION_ARGS)
 	BackgroundWorkerHandle *handle;
 	pid_t		pid;
 
-	handle = worker_spi_launch_internal(i, &pid);
+	handle = worker_spi_launch_internal(0, 0, &pid);
 	if (handle == NULL)
 		PG_RETURN_NULL();
 	PG_RETURN_INT32(pid);
