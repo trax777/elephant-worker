@@ -732,6 +732,11 @@ BEGIN
     RETURNING *
     INTO job_log;
 
+    UPDATE @extschema@.member_job mj
+       SET failure_count = (case when job_log.job_sqlstate <> '00000' then failure_count+1 else failure_count end),
+           success_count = (case when job_log.job_sqlstate =  '00000' then success_count+1 else success_count end),
+           last_executed = job_log.job_started;
+
     RETURN job_log;
 END;
 $BODY$
