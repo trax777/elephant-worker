@@ -8,7 +8,7 @@ CREATE FUNCTION @extschema@.update_job(
         enabled boolean default null,
         job_timeout interval default null,
         parallel boolean default null)
-RETURNS @extschema@.my_job
+RETURNS @extschema@.member_job
 LANGUAGE SQL
 AS
 $BODY$

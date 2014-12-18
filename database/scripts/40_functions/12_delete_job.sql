@@ -1,5 +1,5 @@
 CREATE FUNCTION @extschema@.delete_job(job_id integer)
-RETURNS @extschema@.my_job
+RETURNS @extschema@.member_job
 RETURNS NULL ON NULL INPUT
 LANGUAGE SQL
 AS

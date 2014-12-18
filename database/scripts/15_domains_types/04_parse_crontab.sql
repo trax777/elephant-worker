@@ -48,6 +48,9 @@ $BODY$
 SECURITY INVOKER
 IMMUTABLE;
 
+COMMENT ON FUNCTION @extschema@.parse_cronfield (text, int, int) IS
+'Parses a single crontab field. Raises an error if the field is definitely invalid, or null when it is unknown';
+
 -- Parsing a crontab entry seems tedious, but it is usefull to do
 -- it as part of a check constraint. We ensure that there are only
 -- valid entries in the job table.
@@ -117,3 +120,14 @@ END;
 $BODY$
 SECURITY INVOKER
 IMMUTABLE;
+
+COMMENT ON FUNCTION @extschema@.parse_crontab (schedule text) IS
+'Tries to parse a string into 5 int[] containing the expanded values for this entry.
+Most crontab style entries are allowed.
+
+Returns null on non-crontab format, raises exception on invalid crontab format.
+
+Expanding 7-55/9 would for example become: {7,16,25,34,43,52}
+
+This structure is useful for building an index which can be used for quering which job
+should be run at a specific time.';
