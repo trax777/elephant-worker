@@ -21,13 +21,13 @@ BEGIN
       JOIN pg_catalog.pg_roles    pr ON (job.roloid = pr.oid)
       JOIN pg_catalog.pg_database pd ON (job.datoid = pd.oid)
      WHERE pg_has_role(session_user, roloid, 'MEMBER')
-       AND (parse_crontab(schedule)).minute @> minute
-       AND (parse_crontab(schedule)).hour   @> hour
-       AND (parse_crontab(schedule)).month  @> month
+       AND (schedule_matcher(schedule)).minute @> minute
+       AND (schedule_matcher(schedule)).hour   @> hour
+       AND (schedule_matcher(schedule)).month  @> month
        AND (
-                (parse_crontab(schedule)).dom @> dom
+                (schedule_matcher(schedule)).dom @> dom
                 OR
-                (parse_crontab(schedule)).dow @> dow
+                (schedule_matcher(schedule)).dow @> dow
            )
        AND enabled = true
 

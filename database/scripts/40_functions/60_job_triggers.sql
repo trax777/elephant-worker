@@ -16,7 +16,7 @@ BEGIN
         DETAIL  = format('You are not a member of role "%s"', user_name);
     END IF;
 
-    IF NEW.schedule IS NOT NULL AND @extschema@.parse_crontab(NEW.schedule) IS NULL THEN
+    IF NEW.schedule IS NOT NULL AND @extschema@.schedule_matcher(NEW.schedule) IS NULL THEN
         -- We convert the user provided timestamps into 'YYYY-MM-DD HH24:MI OF'
         NEW.schedule := @extschema@.parse_truncate_timestamps(NEW.schedule);
 
