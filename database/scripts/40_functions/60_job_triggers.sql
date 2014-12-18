@@ -27,6 +27,12 @@ BEGIN
         END IF;
     END IF;
 
+    IF TG_OP = 'UPDATE' AND NEW.job_id <> OLD.job_id THEN
+        RAISE SQLSTATE '42501' USING
+        MESSAGE = 'Permission denied for relation @extschema@.job',
+        DETAIL  = 'Update of primary key is disallowed';
+    END IF;
+
     RETURN NEW;
 END;
 $BODY$

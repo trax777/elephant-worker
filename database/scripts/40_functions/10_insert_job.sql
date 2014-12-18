@@ -7,7 +7,7 @@ CREATE FUNCTION @extschema@.insert_job(
         enabled boolean         default true,
         job_timeout interval    default '6 hours',
         parallel boolean        default false)
-RETURNS @extschema@.my_job
+RETURNS @extschema@.member_job
 LANGUAGE SQL
 AS
 $BODY$

@@ -1,5 +1,6 @@
+
 CREATE FUNCTION @extschema@.job_scheduled_at(runtime timestamptz default clock_timestamp())
-RETURNS SETOF @extschema@.my_job
+RETURNS SETOF @extschema@.member_job
 RETURNS NULL ON NULL INPUT
 LANGUAGE plpgsql
 AS

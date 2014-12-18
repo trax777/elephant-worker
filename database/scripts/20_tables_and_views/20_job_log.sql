@@ -9,7 +9,8 @@ CREATE TABLE @extschema@.job_log (
     job_sqlstate        character varying(5),
     exception_message   text,
     exception_detail    text,
-    exception_hint      text
+    exception_hint      text,
+    exception_context   text
 );
 CREATE INDEX ON @extschema@.job_log (job_started);
 CREATE INDEX ON @extschema@.job_log (job_finished);
@@ -41,8 +42,8 @@ COMMENT ON VIEW @extschema@.member_job_log IS
 
 
 
-GRANT SELECT, DELETE, INSERT, UPDATE ON @extschema@.my_job_log TO job_scheduler;
-GRANT SELECT, DELETE, INSERT, UPDATE ON @extschema@.member_job_log TO job_scheduler;
+GRANT SELECT, DELETE, INSERT, UPDATE(job_finished,job_sqlstate,exception_context,exception_message,exception_detail,exception_hint) ON @extschema@.my_job_log TO job_scheduler;
+GRANT SELECT, DELETE, INSERT, UPDATE(job_finished,job_sqlstate,exception_context,exception_message,exception_detail,exception_hint) ON @extschema@.member_job_log TO job_scheduler;
 GRANT SELECT ON @extschema@.job_log TO job_monitor;
 
 DO
