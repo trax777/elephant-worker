@@ -21,13 +21,13 @@ BEGIN
       JOIN pg_catalog.pg_roles    pr ON (job.roloid = pr.oid)
       JOIN pg_catalog.pg_database pd ON (job.datoid = pd.oid)
      WHERE pg_has_role(session_user, roloid, 'MEMBER')
-       AND (schedule_matcher(schedule)).minute @> minute
-       AND (schedule_matcher(schedule)).hour   @> hour
-       AND (schedule_matcher(schedule)).month  @> month
+       AND (@extschema@.schedule_matcher(@extschema@.schedule)).minute @> minute
+       AND (@extschema@.schedule_matcher(@extschema@.schedule)).hour   @> hour
+       AND (@extschema@.schedule_matcher(@extschema@.schedule)).month  @> month
        AND (
-                (schedule_matcher(schedule)).dom @> dom
+                (@extschema@.schedule_matcher(@extschema@.schedule)).dom @> dom
                 OR
-                (schedule_matcher(schedule)).dow @> dow
+                (@extschema@.schedule_matcher(@extschema@.schedule)).dow @> dow
            )
        AND enabled = true
 
@@ -40,7 +40,7 @@ BEGIN
       JOIN pg_catalog.pg_roles    pr ON (job.roloid = pr.oid)
       JOIN pg_catalog.pg_database pd ON (job.datoid = pd.oid)
      WHERE pg_has_role(session_user, roloid, 'MEMBER')
-       AND parse_truncate_timestamps(schedule) @> utc_string
+       AND parse_truncate_timestamps(@extschema@.schedule) @> utc_string
        AND enabled = true;
 END;
 $BODY$
@@ -48,7 +48,7 @@ SECURITY DEFINER
 ROWS 3;
 
 COMMENT ON FUNCTION @extschema@.job_scheduled_at(timestamptz) IS
-'Returns all the jobs that should be running this minute according to their schedule.
+'Returns all the jobs that should be running this minute according to their @extschema@.schedule.
 When no value is provided for runtime, the clock_timestamp() will be used.
 
 This is a function accessing the @extschema@.job table directly, and therefore

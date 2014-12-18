@@ -19,7 +19,7 @@ CREATE INDEX ON @extschema@.job_log (job_sqlstate);
 -- or the job log is imported somewhere else for processing
 
 -- Make sure the contents of this table is dumped when pg_dump is called
-SELECT pg_catalog.pg_extension_config_dump('job_log', '');
+SELECT pg_catalog.pg_extension_config_dump('@extschema@.job_log', '');
 
 COMMENT ON TABLE @extschema@.job_log IS
 'All the job logs are stored in this table.';

@@ -1,3 +1,8 @@
+DROP schema inspect cascade;
+CREATE schema inspect;
+
+set search_path=inspect;
+\set ON_ERROR_STOP on
 DO
 $$
 DECLARE
@@ -13,11 +18,52 @@ BEGIN
             EXECUTE format('CREATE ROLE %I NOLOGIN', role);
             EXECUTE format('COMMENT ON ROLE %I IS ''This role was created for elephant_worker on %s''', role, clock_timestamp()::timestamp(0));
         END IF;
-        EXECUTE format('GRANT USAGE ON SCHEMA %I TO %I', '@extschema@', role);
+        EXECUTE format('GRANT USAGE ON SCHEMA %I TO %I', 'inspect', role);
     END LOOP;
 END;
 $$;
-CREATE TYPE @extschema@.schedule AS (
+CREATE FUNCTION inspect.parse_truncate_timestamps(schedule text)
+RETURNS text[]
+RETURNS null ON null input
+LANGUAGE plpgsql
+AS
+$BODY$
+DECLARE
+    utc_times timestamptz[];
+    utc_strings text[];
+BEGIN
+    -- If this already is a valid crontab, do nothing
+    IF (inspect.schedule_matcher(schedule)).minute IS NOT NULL THEN
+        RETURN null;
+    END IF;
+
+    utc_times := ('{'||schedule||'}')::timestamptz[];
+    --RAISE NOTICE '%', utc_times;
+
+    -- Convert the timestamp to utc, convert to string
+    utc_strings := array( SELECT to_char(unnest at time zone 'utc', 'YYYY-MM-DD HH24:MI OF')
+                            FROM unnest(utc_times)
+                        ORDER BY 1);
+    RETURN utc_strings;
+
+EXCEPTION
+    WHEN others THEN
+        -- This parse failed, this means it is not a valid (array of) timestamps
+        -- but it is not an error in itself
+        RETURN null;
+END;
+$BODY$
+IMMUTABLE
+SECURITY INVOKER
+COST 10;
+
+COMMENT ON FUNCTION inspect.parse_truncate_timestamps(text) IS
+'Parses the provided schedule into a text[] of UTC timestamps.
+
+Truncates given timestamp(s) on the minute.
+
+Useful as a structure for indexing.';
+CREATE TYPE inspect.schedule AS (
     minute int [],
     hour   int [],
     dom    int [],
@@ -27,8 +73,8 @@ CREATE TYPE @extschema@.schedule AS (
     utc_string text []
 );
 
-CREATE FUNCTION @extschema@.schedule(timestamptz)
-RETURNS @extschema@.schedule
+CREATE FUNCTION inspect.schedule(timestamptz)
+RETURNS inspect.schedule
 RETURNS NULL ON NULL INPUT
 LANGUAGE SQL
 AS
@@ -44,11 +90,11 @@ $BODY$
 SECURITY INVOKER
 STABLE;
 
-CREATE CAST (timestamptz AS @extschema@.schedule)
-    WITH FUNCTION @extschema@.schedule(timestamptz)
+CREATE CAST (timestamptz AS inspect.schedule)
+    WITH FUNCTION inspect.schedule(timestamptz)
     AS IMPLICIT;
 
-CREATE FUNCTION @extschema@.timestamptz(@extschema@.schedule)
+CREATE FUNCTION inspect.timestamptz(inspect.schedule)
 RETURNS timestamptz[]
 RETURNS NULL ON NULL INPUT
 LANGUAGE SQL
@@ -59,11 +105,11 @@ $BODY$
 SECURITY INVOKER
 STABLE;
 
-CREATE CAST (@extschema@.schedule AS timestamptz[])
-    WITH FUNCTION @extschema@.timestamptz(@extschema@.schedule)
+CREATE CAST (inspect.schedule AS timestamptz[])
+    WITH FUNCTION inspect.timestamptz(inspect.schedule)
     AS IMPLICIT;
 
-CREATE FUNCTION @extschema@.text(@extschema@.schedule)
+CREATE FUNCTION inspect.text(schedule)
 RETURNS text
 RETURNS NULL ON NULL INPUT
 LANGUAGE SQL
@@ -79,12 +125,12 @@ $BODY$
 SECURITY INVOKER
 IMMUTABLE;
 
-CREATE CAST (@extschema@.schedule AS text)
-    WITH FUNCTION @extschema@.text(@extschema@.schedule)
+CREATE CAST (inspect.schedule AS text)
+    WITH FUNCTION inspect.text(inspect.schedule)
     AS IMPLICIT;
 
-CREATE FUNCTION @extschema@.schedule(timestamptz [])
-RETURNS @extschema@.schedule
+CREATE FUNCTION inspect.schedule(timestamptz [])
+RETURNS inspect.schedule
 RETURNS NULL ON NULL INPUT
 LANGUAGE SQL
 AS
@@ -100,11 +146,11 @@ $BODY$
 SECURITY INVOKER
 STABLE;
 
-CREATE CAST (timestamptz[] AS @extschema@.schedule)
-    WITH FUNCTION @extschema@.schedule(timestamptz [])
+CREATE CAST (timestamptz[] AS inspect.schedule)
+    WITH FUNCTION inspect.schedule(timestamptz [])
     AS IMPLICIT;
 
-CREATE FUNCTION @extschema@.parse_cronfield (cronfield text, minvalue int, maxvalue int)
+CREATE FUNCTION inspect.parse_cronfield (cronfield text, minvalue int, maxvalue int)
 RETURNS int []
 RETURNS NULL ON NULL INPUT
 LANGUAGE plpgsql
@@ -154,22 +200,22 @@ $BODY$
 SECURITY INVOKER
 IMMUTABLE;
 
-COMMENT ON FUNCTION @extschema@.parse_cronfield (text, int, int) IS
+COMMENT ON FUNCTION inspect.parse_cronfield (text, int, int) IS
 'Parses a single crontab field. Raises an error if the field is definitely invalid, or null when it is unknown';
 
 -- Parsing a crontab entry seems tedious, but it is usefull to do
 -- it as part of a check constraint. We ensure that there are only
 -- valid entries in the job table.
 -- Main source for decicions is man 5 crontab
-CREATE FUNCTION @extschema@.schedule(text)
-RETURNS @extschema@.schedule
+CREATE FUNCTION inspect.schedule(schedule text)
+RETURNS inspect.schedule
 RETURNS NULL ON NULL INPUT
 LANGUAGE plpgsql
 AS
 $BODY$
 DECLARE
-    entries text [] := regexp_split_to_array($1, '\s+');
-    matcher @extschema@.schedule;
+    entries text [] := regexp_split_to_array(schedule, '\s+');
+    matcher inspect.schedule;
     utc_times timestamptz[];
 BEGIN
     -- Allow some named entries, we transform them into the documented equivalent
@@ -187,7 +233,7 @@ BEGIN
         END IF;
     END IF;
 
-    matcher.input := $1;
+    matcher.input := schedule;
 
     IF array_length(entries, 1) = 5 THEN
         matcher.minute := parse_cronfield(entries[1],0,59);
@@ -228,36 +274,41 @@ BEGIN
     -- This is mainly useful for reparsing our own output (eat your own ...)
 
     -- Convert the timestamp to utc, convert to string, sort
-    matcher.utc_string := array(SELECT unnest FROM unnest(format('{%s}', $1)::text[]) ORDER BY 1);
+    matcher.utc_string := array(SELECT unnest FROM unnest(format('{%s}', schedule)::text[]) ORDER BY 1);
 
     RETURN matcher;
 EXCEPTION
     --WHEN data_exception THEN
     WHEN division_by_zero THEN
         RAISE SQLSTATE '22P02' USING
-            MESSAGE = 'Invalid syntax for @extschema@.schedule',
-            DETAIL  = format('"%s" cannot be converted into a @extschema@.schedule', @extschema@.schedule),
+            MESSAGE = 'Invalid syntax for schedule',
+            DETAIL  = format('"%s" cannot be converted into a schedule', schedule),
             HINT    = 'Allowed is: a valid crontab-style entry, a(n array of) "YYYY-MM-DD HH24:MI +00" timestamp(s)';
 END;
 $BODY$
 SECURITY INVOKER
 IMMUTABLE;
 
-COMMENT ON FUNCTION @extschema@.schedule(text) IS
+COMMENT ON FUNCTION inspect.schedule (schedule text) IS
 'Tries to parse a string into 5 int[] containing the expanded values for this entry.
 Most crontab style entries are allowed.
 
-If no valid crontab is found, it tries to parse the string as:
-a(n array of) "YYYY-MM-DD HH24:MI +00" timestamp(s)';
+Returns null on non-crontab format, raises exception on invalid crontab format.
 
-CREATE CAST (text AS @extschema@.schedule)
-    WITH FUNCTION @extschema@.schedule(text)
+Expanding 7-55/9 would for example become: {7,16,25,34,43,52}
+
+This structure is useful for building an index which can be used for quering which job
+should be run at a specific time.';
+
+CREATE CAST (text AS inspect.schedule)
+    WITH FUNCTION inspect.schedule(text)
     AS IMPLICIT;
-CREATE TABLE @extschema@.job (
+
+CREATE TABLE inspect.job (
     job_id              serial primary key,
     datoid              oid not null,
     roloid              oid not null,
-    schedule            schedule not null default ''::text::@extschema@.schedule,
+    schedule            inspect.schedule,
     enabled             boolean not null default true,
     failure_count       integer not null default 0 check ( failure_count>=0 ),
     success_count       integer not null default 0 check ( success_count>=0 ),
@@ -267,33 +318,33 @@ CREATE TABLE @extschema@.job (
     job_timeout         interval not null default '6 hours'::interval,
     last_executed       timestamptz
 );
-CREATE UNIQUE INDEX job_unique_definition_and_schedule ON @extschema@.job(datoid, roloid, schedule, job_command);
-COMMENT ON TABLE @extschema@.job IS
+CREATE UNIQUE INDEX job_unique_definition_and_schedule ON inspect.job(datoid, roloid, job_command) WHERE schedule IS NULL;
+COMMENT ON TABLE inspect.job IS
 'This table holds all the job definitions.
 
-The @extschema@.schedule indexes on this table are used to
+The schedule indexes on this table are used to
 quickly identify which jobs should be running on a specific moment.';
-SELECT pg_catalog.pg_extension_config_dump('@extschema@.job', '');
 
 
-CREATE VIEW @extschema@.my_job WITH (security_barrier) AS
+
+CREATE VIEW inspect.my_job WITH (security_barrier) AS
 SELECT *,
        (SELECT datname FROM pg_catalog.pg_database WHERE oid=datoid) AS datname,
        (SELECT rolname FROM pg_catalog.pg_roles    WHERE oid=roloid) AS rolname
-  FROM @extschema@.job
+  FROM inspect.job
  WHERE roloid = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname=current_user)
   WITH CASCADED CHECK OPTION;
-COMMENT ON VIEW @extschema@.my_job IS
+COMMENT ON VIEW inspect.my_job IS
 'This view shows all the job definitions of the current_user';
 
-CREATE VIEW @extschema@.member_job WITH (security_barrier) AS
+CREATE VIEW inspect.member_job WITH (security_barrier) AS
 SELECT *,
        (SELECT datname FROM pg_catalog.pg_database WHERE oid=datoid) AS datname,
        (SELECT rolname FROM pg_catalog.pg_roles    WHERE oid=roloid) AS rolname
-  FROM @extschema@.job
+  FROM inspect.job
  WHERE pg_has_role(current_user, (SELECT oid FROM pg_catalog.pg_roles WHERE oid=roloid), 'MEMBER')
   WITH CASCADED CHECK OPTION;
-COMMENT ON VIEW @extschema@.member_job IS
+COMMENT ON VIEW inspect.member_job IS
 'This view shows all the job definitions of the roles of which the current_user is a member.';
 
 DO
@@ -312,7 +363,7 @@ BEGIN
             COMMENT ON COLUMN %1$I.%2$I.roloid IS
                     'The oid of the user who should run this job.';
             COMMENT ON COLUMN %1$I.%2$I.schedule IS
-                    E'The @extschema@.schedule for this job.';
+                    E'The schedule for this job, Hint: \\dD+ inspect.schedule';
             COMMENT ON COLUMN %1$I.%2$I.enabled IS
                     'Whether or not this job is enabled';
             COMMENT ON COLUMN %1$I.%2$I.failure_count IS
@@ -332,7 +383,7 @@ BEGIN
 
 
                    $format$,
-                   '@extschema@',
+                   'inspect',
                    relname);
         IF relname <> 'job'
         THEN
@@ -342,7 +393,7 @@ BEGIN
             COMMENT ON COLUMN %1$I.%2$I.rolname IS
                     'The name of the user/role who should run this job.';
                        $format$,
-                       '@extschema@',
+                       'inspect',
                        relname);
         END IF;
     END LOOP;
@@ -350,15 +401,15 @@ END;
 $$;
 
 -- Needs more finegraining
-GRANT SELECT, DELETE, INSERT, UPDATE ON @extschema@.my_job TO job_scheduler;
-GRANT SELECT, DELETE, INSERT, UPDATE ON @extschema@.member_job TO job_scheduler;
-GRANT SELECT ON @extschema@.job TO job_monitor;
+GRANT SELECT, DELETE, INSERT, UPDATE ON inspect.my_job TO job_scheduler;
+GRANT SELECT, DELETE, INSERT, UPDATE ON inspect.member_job TO job_scheduler;
+GRANT SELECT ON inspect.job TO job_monitor;
 
---CREATE INDEX @extschema@.schedule_crontab_minute ON @extschema@.job USING GIN (((@extschema@.schedule(@extschema@.schedule)).minute)) WHERE (@extschema@.schedule(@extschema@.schedule)).minute IS NOT NULL;
---CREATE INDEX @extschema@.schedule_crontab_hour ON @extschema@.job USING GIN (((@extschema@.schedule(@extschema@.schedule)).hour)) WHERE (@extschema@.schedule(@extschema@.schedule)).hour IS NOT NULL;
---CREATE INDEX @extschema@.schedule_crontab_dom ON @extschema@.job USING GIN (((@extschema@.schedule(@extschema@.schedule)).dom)) WHERE (@extschema@.schedule(@extschema@.schedule)).dom IS NOT NULL;
---CREATE INDEX @extschema@.schedule_timestamps ON @extschema@.job USING GIN (parse_truncate_timestamps(@extschema@.schedule)) WHERE parse_truncate_timestamps(@extschema@.schedule) IS NOT NULL;
-CREATE TABLE @extschema@.job_log (
+CREATE INDEX schedule_crontab_minute ON inspect.job USING GIN (((schedule(schedule)).minute)) WHERE (schedule(schedule)).minute IS NOT NULL;
+CREATE INDEX schedule_crontab_hour ON inspect.job USING GIN (((schedule(schedule)).hour)) WHERE (schedule(schedule)).hour IS NOT NULL;
+CREATE INDEX schedule_crontab_dom ON inspect.job USING GIN (((schedule(schedule)).dom)) WHERE (schedule(schedule)).dom IS NOT NULL;
+CREATE INDEX schedule_timestamps ON inspect.job USING GIN (parse_truncate_timestamps(schedule)) WHERE parse_truncate_timestamps(schedule) IS NOT NULL;
+CREATE TABLE inspect.job_log (
     jl_id               serial primary key,
     job_id              integer not null,
     rolname             name not null,
@@ -372,39 +423,39 @@ CREATE TABLE @extschema@.job_log (
     exception_hint      text,
     exception_context   text
 );
-CREATE INDEX ON @extschema@.job_log (job_started);
-CREATE INDEX ON @extschema@.job_log (job_finished);
-CREATE INDEX ON @extschema@.job_log (job_sqlstate);
+CREATE INDEX ON inspect.job_log (job_started);
+CREATE INDEX ON inspect.job_log (job_finished);
+CREATE INDEX ON inspect.job_log (job_sqlstate);
 -- We decide not to add a foreign key referencing the job table, jobs may be deleted (we could use ON DELETE SET NULL)
 -- or the job log is imported somewhere else for processing
 
 -- Make sure the contents of this table is dumped when pg_dump is called
-SELECT pg_catalog.pg_extension_config_dump('@extschema@.job_log', '');
 
-COMMENT ON TABLE @extschema@.job_log IS
+
+COMMENT ON TABLE inspect.job_log IS
 'All the job logs are stored in this table.';
 
-CREATE VIEW @extschema@.my_job_log WITH (security_barrier) AS
+CREATE VIEW inspect.my_job_log WITH (security_barrier) AS
 SELECT *
-  FROM @extschema@.job_log
+  FROM inspect.job_log
  WHERE rolname = (SELECT rolname FROM pg_catalog.pg_roles WHERE rolname=current_user)
   WITH CASCADED CHECK OPTION;
-COMMENT ON VIEW @extschema@.my_job_log IS
+COMMENT ON VIEW inspect.my_job_log IS
 'All the job logs for the current_user';
 
-CREATE VIEW @extschema@.member_job_log WITH (security_barrier) AS
+CREATE VIEW inspect.member_job_log WITH (security_barrier) AS
 SELECT *
-  FROM @extschema@.job_log jl
+  FROM inspect.job_log jl
  WHERE pg_has_role (current_user, (SELECT rolname FROM pg_catalog.pg_roles pr WHERE pr.rolname=jl.rolname), 'MEMBER')
   WITH CASCADED CHECK OPTION;
-COMMENT ON VIEW @extschema@.member_job_log IS
+COMMENT ON VIEW inspect.member_job_log IS
 'Shows all the job logs for the jobs run by roles of which current_user is a member';
 
 
 
-GRANT SELECT, DELETE, INSERT, UPDATE(job_finished,job_sqlstate,exception_context,exception_message,exception_detail,exception_hint) ON @extschema@.my_job_log TO job_scheduler;
-GRANT SELECT, DELETE, INSERT, UPDATE(job_finished,job_sqlstate,exception_context,exception_message,exception_detail,exception_hint) ON @extschema@.member_job_log TO job_scheduler;
-GRANT SELECT ON @extschema@.job_log TO job_monitor;
+GRANT SELECT, DELETE, INSERT, UPDATE(job_finished,job_sqlstate,exception_context,exception_message,exception_detail,exception_hint) ON inspect.my_job_log TO job_scheduler;
+GRANT SELECT, DELETE, INSERT, UPDATE(job_finished,job_sqlstate,exception_context,exception_message,exception_detail,exception_hint) ON inspect.member_job_log TO job_scheduler;
+GRANT SELECT ON inspect.job_log TO job_monitor;
 
 DO
 $$
@@ -441,25 +492,36 @@ BEGIN
                     'Hint for the raised exception';
 
                    $format$,
-                   '@extschema@',
+                   'inspect',
                    relname);
     END LOOP;
 END;
 $$;
-CREATE FUNCTION @extschema@.insert_job(
+CREATE FUNCTION text_matches(schedule text, matcher inspect.schedule_matcher)
+RETURNS BOOLEAN
+RETURNS NULL ON NULL INPUT
+LANGUAGE SQL
+AS
+$BODY$
+    
+    SELECT true;
+$BODY$
+SECURITY INVOKER
+IMMUTABLE;
+CREATE FUNCTION inspect.insert_job(
         job_command text,
         datname name,
-        schedule @extschema@.schedule       default ''::text::@extschema@.schedule,
+        schedule text default null,
         rolname name            default current_user,
         job_description text    default null,
         enabled boolean         default true,
         job_timeout interval    default '6 hours',
         parallel boolean        default false)
-RETURNS @extschema@.member_job
+RETURNS inspect.member_job
 LANGUAGE SQL
 AS
 $BODY$
-    INSERT INTO @extschema@.member_job (
+    INSERT INTO inspect.member_job (
         job_command,
         schedule,
         job_description,
@@ -481,23 +543,23 @@ $BODY$
     RETURNING *;
 $BODY$;
 
-COMMENT ON FUNCTION @extschema@.insert_job(text, name, @extschema@.schedule, name, text, boolean,interval,boolean) IS
+COMMENT ON FUNCTION inspect.insert_job(text, name, text, name,text, boolean,interval,boolean) IS
 'Creates a job entry. Returns the record containing this new job.';
-CREATE FUNCTION @extschema@.update_job(
+CREATE FUNCTION inspect.update_job(
 		job_id integer,
         job_command text default null,
         datname name default null,
-        schedule @extschema@.schedule default null,
+        schedule text default null,
         rolname name default null,
         job_description text default null,
         enabled boolean default null,
         job_timeout interval default null,
         parallel boolean default null)
-RETURNS @extschema@.member_job
+RETURNS inspect.member_job
 LANGUAGE SQL
 AS
 $BODY$
-	UPDATE @extschema@.member_job mj SET
+	UPDATE inspect.member_job mj SET
 		job_command     = coalesce(update_job.job_command,     job_command),
 		schedule        = coalesce(update_job.schedule,        schedule),
 		job_description = coalesce(update_job.job_description, job_description),
@@ -510,22 +572,22 @@ $BODY$
     RETURNING *;
 $BODY$;
 
-COMMENT ON FUNCTION @extschema@.update_job(integer, text, name, @extschema@.schedule, name, text, boolean, interval, boolean) IS
+COMMENT ON FUNCTION inspect.update_job(integer, text, name, text, name, text, boolean, interval, boolean) IS
 'Update a given job_id with the provided values. Returns the new (update) record.';
-CREATE FUNCTION @extschema@.delete_job(job_id integer)
-RETURNS @extschema@.member_job
+CREATE FUNCTION inspect.delete_job(job_id integer)
+RETURNS inspect.member_job
 RETURNS NULL ON NULL INPUT
 LANGUAGE SQL
 AS
 $BODY$
-    DELETE FROM @extschema@.member_job mj
+    DELETE FROM inspect.member_job mj
     WHERE mj.job_id=delete_job.job_id
     RETURNING *;
 $BODY$;
 
-COMMENT ON FUNCTION @extschema@.delete_job(job_id integer) IS
+COMMENT ON FUNCTION inspect.delete_job(job_id integer) IS
 'Deletes the job with the specified job_id. Returns the deleted record.';
-CREATE FUNCTION @extschema@.validate_job_definition() RETURNS TRIGGER AS
+CREATE FUNCTION inspect.validate_job_definition() RETURNS TRIGGER AS
 $BODY$
 BEGIN
     IF NEW.roloid IS NULL
@@ -543,20 +605,20 @@ BEGIN
         DETAIL  = format('You are not a member of role "%s"', user_name);
     END IF;
 
-    IF NEW.schedule IS NOT NULL AND @extschema@.schedule_matcher(NEW.schedule) IS NULL THEN
+    IF NEW.schedule IS NOT NULL AND inspect.schedule_matcher(NEW.schedule) IS NULL THEN
         -- We convert the user provided timestamps into 'YYYY-MM-DD HH24:MI OF'
-        NEW.schedule := @extschema@.parse_truncate_timestamps(NEW.schedule);
+        NEW.schedule := inspect.parse_truncate_timestamps(NEW.schedule);
 
         -- Special case: provided timestamp matches current moment, we bump it 1 minute, so
         -- it will be executed asap.
         IF NEW.schedule = to_char(clock_timestamp() at time zone 'utc', '{\"YYYY-MM-DD HH24:MI OF\"}') THEN
-            NEW.schedule := @extschema@.parse_truncate_timestamps((NEW.schedule::timestamptz + interval '1 minute')::text);
+            NEW.schedule := inspect.parse_truncate_timestamps((NEW.schedule::timestamptz + interval '1 minute')::text);
         END IF;
     END IF;
 
     IF TG_OP = 'UPDATE' AND NEW.job_id <> OLD.job_id THEN
         RAISE SQLSTATE '42501' USING
-        MESSAGE = 'Permission denied for relation @extschema@.job',
+        MESSAGE = 'Permission denied for relation inspect.job',
         DETAIL  = 'Update of primary key is disallowed';
     END IF;
 
@@ -565,21 +627,21 @@ END;
 $BODY$
 LANGUAGE plpgsql;
 
-COMMENT ON FUNCTION @extschema@.validate_job_definition() IS
-$$We want to maintain some sanity on the @extschema@.job table.
+COMMENT ON FUNCTION inspect.validate_job_definition() IS
+$$We want to maintain some sanity on the inspect.job table.
 
 Many checks are taken care of by check constraints
-(on the text DOMAIN, and the @extschema@.job TABLE).
+(on the text DOMAIN, and the inspect.job TABLE).
 
-We do some extra checks here and if a @extschema@.schedule consisting of timestamps is provided
+We do some extra checks here and if a schedule consisting of timestamps is provided
 we convert it into timestaps at utc with a granularity of 1 minute.
 $$;
 
-CREATE TRIGGER validate_job_definition BEFORE INSERT OR UPDATE ON @extschema@.job
-    FOR EACH ROW EXECUTE PROCEDURE @extschema@.validate_job_definition();
+CREATE TRIGGER validate_job_definition BEFORE INSERT OR UPDATE ON inspect.job
+    FOR EACH ROW EXECUTE PROCEDURE inspect.validate_job_definition();
 
-CREATE FUNCTION @extschema@.job_scheduled_at(runtime timestamptz default clock_timestamp())
-RETURNS SETOF @extschema@.member_job
+CREATE FUNCTION inspect.job_scheduled_at(runtime timestamptz default clock_timestamp())
+RETURNS SETOF inspect.member_job
 RETURNS NULL ON NULL INPUT
 LANGUAGE plpgsql
 AS
@@ -596,17 +658,17 @@ BEGIN
     SELECT job.*,
            datname,
            rolname
-      FROM @extschema@.job
+      FROM inspect.job
       JOIN pg_catalog.pg_roles    pr ON (job.roloid = pr.oid)
       JOIN pg_catalog.pg_database pd ON (job.datoid = pd.oid)
      WHERE pg_has_role(session_user, roloid, 'MEMBER')
-       AND (@extschema@.schedule_matcher(@extschema@.schedule)).minute @> minute
-       AND (@extschema@.schedule_matcher(@extschema@.schedule)).hour   @> hour
-       AND (@extschema@.schedule_matcher(@extschema@.schedule)).month  @> month
+       AND (schedule_matcher(schedule)).minute @> minute
+       AND (schedule_matcher(schedule)).hour   @> hour
+       AND (schedule_matcher(schedule)).month  @> month
        AND (
-                (@extschema@.schedule_matcher(@extschema@.schedule)).dom @> dom
+                (schedule_matcher(schedule)).dom @> dom
                 OR
-                (@extschema@.schedule_matcher(@extschema@.schedule)).dow @> dow
+                (schedule_matcher(schedule)).dow @> dow
            )
        AND enabled = true
 
@@ -615,31 +677,31 @@ BEGIN
     SELECT job.*,
            datname,
            rolname
-      FROM @extschema@.job
+      FROM inspect.job
       JOIN pg_catalog.pg_roles    pr ON (job.roloid = pr.oid)
       JOIN pg_catalog.pg_database pd ON (job.datoid = pd.oid)
      WHERE pg_has_role(session_user, roloid, 'MEMBER')
-       AND parse_truncate_timestamps(@extschema@.schedule) @> utc_string
+       AND parse_truncate_timestamps(schedule) @> utc_string
        AND enabled = true;
 END;
 $BODY$
 SECURITY DEFINER
 ROWS 3;
 
-COMMENT ON FUNCTION @extschema@.job_scheduled_at(timestamptz) IS
-'Returns all the jobs that should be running this minute according to their @extschema@.schedule.
+COMMENT ON FUNCTION inspect.job_scheduled_at(timestamptz) IS
+'Returns all the jobs that should be running this minute according to their schedule.
 When no value is provided for runtime, the clock_timestamp() will be used.
 
-This is a function accessing the @extschema@.job table directly, and therefore
+This is a function accessing the inspect.job table directly, and therefore
 needs to be defined as a security definer function. The where clauses should however
 safely limit the output.';
-CREATE FUNCTION @extschema@.create_job_log(job_id integer)
-RETURNS @extschema@.member_job_log
+CREATE FUNCTION inspect.create_job_log(job_id integer)
+RETURNS inspect.member_job_log
 RETURNS NULL ON NULL INPUT
 LANGUAGE SQL
 AS
 $BODY$
-     INSERT INTO @extschema@.member_job_log (
+     INSERT INTO inspect.member_job_log (
             job_id,
             rolname,
             datname,
@@ -651,39 +713,39 @@ $BODY$
             datname,
             job_command,
             clock_timestamp()
-       FROM @extschema@.member_job mj
+       FROM inspect.member_job mj
       WHERE mj.job_id = create_job_log.job_id
       RETURNING *
 $BODY$
 SECURITY INVOKER;
-CREATE OR REPLACE FUNCTION @extschema@.run_job(job_id integer, jl_id integer default null)
-RETURNS @extschema@.member_job_log
+CREATE OR REPLACE FUNCTION inspect.run_job(job_id integer, jl_id integer default null)
+RETURNS inspect.member_job_log
 LANGUAGE plpgsql
 AS
 $BODY$
 DECLARE
-    job_log @extschema@.member_job_log;
+    job_log inspect.member_job_log;
 BEGIN
 
     -- Generate a log entry if no jl_id provided
     IF jl_id IS NULL THEN
-        job_log := @extschema@.create_job_log(job_id);
+        job_log := inspect.create_job_log(job_id);
 
         IF job_log.jl_id IS NULL THEN
             RAISE SQLSTATE '22023' USING
                 MESSAGE = 'Invalid parameter value',
-                DETAIL  = format('Cannot find record with job_id=%s in @extschema@.member_job', coalesce(job_id::text,'NULL'));
+                DETAIL  = format('Cannot find record with job_id=%s in inspect.member_job', coalesce(job_id::text,'NULL'));
         END IF;
     ELSE
         SELECT *
           INTO job_log
-          FROM @extschema@.member_job_log mjl
+          FROM inspect.member_job_log mjl
          WHERE mjl.jl_id = run_job.jl_id;
 
         IF NOT FOUND THEN
             RAISE SQLSTATE '22023' USING
                 MESSAGE = 'Invalid parameter value',
-                DETAIL  = format('Cannot find record with jl_id=%s in @extschema@.member_job_log', coalesce(jl_id::text,'NULL'));
+                DETAIL  = format('Cannot find record with jl_id=%s in inspect.member_job_log', coalesce(jl_id::text,'NULL'));
         END IF;
 
         IF job_log.job_finished IS NOT NULL THEN
@@ -717,7 +779,7 @@ BEGIN
                                     job_log.job_sqlstate      := RETURNED_SQLSTATE;
     END;
 
-    UPDATE @extschema@.member_job_log mjl
+    UPDATE inspect.member_job_log mjl
        SET job_finished      = clock_timestamp(),
            job_sqlstate      = coalesce(job_log.job_sqlstate,'00000'),
            exception_message = job_log.exception_message,
@@ -728,7 +790,7 @@ BEGIN
     RETURNING *
     INTO job_log;
 
-    UPDATE @extschema@.member_job mj
+    UPDATE inspect.member_job mj
        SET failure_count = (case when job_log.job_sqlstate <> '00000' then failure_count+1 else failure_count end),
            success_count = (case when job_log.job_sqlstate =  '00000' then success_count+1 else success_count end),
            last_executed = job_log.job_started;
@@ -777,25 +839,27 @@ DECLARE
 BEGIN
     FOR object IN relation_cursor
     LOOP
-        EXECUTE format('REVOKE ALL ON %I.%I FROM PUBLIC', '@extschema@', object.relname);
+        EXECUTE format('REVOKE ALL ON %I.%I FROM PUBLIC', 'inspect', object.relname);
     END LOOP;
 
     FOR object IN sequence_cursor
     LOOP
-        EXECUTE format('REVOKE ALL ON SEQUENCE %I.%I FROM PUBLIC', '@extschema@', object.relname);
-        EXECUTE format('GRANT USAGE ON SEQUENCE %I.%I TO job_scheduler', '@extschema@', object.relname);
+        EXECUTE format('REVOKE ALL ON SEQUENCE %I.%I FROM PUBLIC', 'inspect', object.relname);
+        EXECUTE format('GRANT USAGE ON SEQUENCE %I.%I TO job_scheduler', 'inspect', object.relname);
     END LOOP;
 
     FOR object IN function_cursor
     LOOP
-        EXECUTE format('REVOKE ALL ON FUNCTION %I.%I(%s) FROM PUBLIC', '@extschema@', object.proname, object.identity_arguments);
-        EXECUTE format('GRANT EXECUTE ON FUNCTION %I.%I(%s) TO job_scheduler', '@extschema@', object.proname, object.identity_arguments);
+        EXECUTE format('REVOKE ALL ON FUNCTION %I.%I(%s) FROM PUBLIC', 'inspect', object.proname, object.identity_arguments);
+        EXECUTE format('GRANT EXECUTE ON FUNCTION %I.%I(%s) TO job_scheduler', 'inspect', object.proname, object.identity_arguments);
     END LOOP;
 
     FOR object IN domain_cursor
     LOOP
-        EXECUTE format('REVOKE ALL ON DOMAIN %I.%I FROM PUBLIC', '@extschema@', object.typname);
-        EXECUTE format('GRANT USAGE ON DOMAIN %I.%I TO job_scheduler', '@extschema@', object.typname);
+        EXECUTE format('REVOKE ALL ON DOMAIN %I.%I FROM PUBLIC', 'inspect', object.typname);
+        EXECUTE format('GRANT USAGE ON DOMAIN %I.%I TO job_scheduler', 'inspect', object.typname);
     END LOOP;
 END;
 $$;
+\set ON_ERROR_STOP off
+reset search_path

@@ -25,5 +25,5 @@ $BODY$
     RETURNING *;
 $BODY$;
 
-COMMENT ON FUNCTION @extschema@.update_job(integer, text, name, schedule, name, text, boolean, interval, boolean) IS
+COMMENT ON FUNCTION @extschema@.update_job(integer, text, name, @extschema@.schedule, name, text, boolean, interval, boolean) IS
 'Update a given job_id with the provided values. Returns the new (update) record.';

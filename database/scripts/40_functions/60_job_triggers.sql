@@ -42,9 +42,9 @@ COMMENT ON FUNCTION @extschema@.validate_job_definition() IS
 $$We want to maintain some sanity on the @extschema@.job table.
 
 Many checks are taken care of by check constraints
-(on the @extschema@.schedule DOMAIN, and the @extschema@.job TABLE).
+(on the text DOMAIN, and the @extschema@.job TABLE).
 
-We do some extra checks here and if a schedule consisting of timestamps is provided
+We do some extra checks here and if a @extschema@.schedule consisting of timestamps is provided
 we convert it into timestaps at utc with a granularity of 1 minute.
 $$;
 

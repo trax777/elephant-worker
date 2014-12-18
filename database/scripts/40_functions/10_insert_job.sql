@@ -1,7 +1,7 @@
 CREATE FUNCTION @extschema@.insert_job(
         job_command text,
         datname name,
-        schedule @extschema@.schedule  default null,
+        schedule @extschema@.schedule       default ''::text::@extschema@.schedule,
         rolname name            default current_user,
         job_description text    default null,
         enabled boolean         default true,
@@ -33,5 +33,5 @@ $BODY$
     RETURNING *;
 $BODY$;
 
-COMMENT ON FUNCTION @extschema@.insert_job(text, name, @extschema@.schedule, name,text, boolean,interval,boolean) IS
+COMMENT ON FUNCTION @extschema@.insert_job(text, name, @extschema@.schedule, name, text, boolean,interval,boolean) IS
 'Creates a job entry. Returns the record containing this new job.';

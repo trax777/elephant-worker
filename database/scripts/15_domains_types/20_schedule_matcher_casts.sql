@@ -1,15 +1,15 @@
--- Casts
-CREATE TYPE @extschema@.schedule_matcher AS (
+CREATE TYPE @extschema@.schedule AS (
     minute int [],
     hour   int [],
     dom    int [],
     month  int [],
     dow    int [],
+    input  text,
     utc_string text []
 );
 
-CREATE FUNCTION @extschema@.schedule_matcher(timestamptz)
-RETURNS @extschema@.schedule_matcher
+CREATE FUNCTION @extschema@.schedule(timestamptz)
+RETURNS @extschema@.schedule
 RETURNS NULL ON NULL INPUT
 LANGUAGE SQL
 AS
@@ -19,16 +19,17 @@ $BODY$
            ARRAY[ extract(day    from $1 ) ]::int[],
            ARRAY[ extract(month  from $1 ) ]::int[],
            ARRAY[ extract(dow    from $1 ) ]::int[],
+           $1::text,
            ARRAY[to_char($1 at time zone 'utc', 'YYYY-MM-DD HH24:MI OF')]::text[]
 $BODY$
 SECURITY INVOKER
 STABLE;
 
-CREATE CAST (timestamptz AS @extschema@.schedule_matcher)
-    WITH FUNCTION @extschema@.schedule_matcher(timestamptz)
+CREATE CAST (timestamptz AS @extschema@.schedule)
+    WITH FUNCTION @extschema@.schedule(timestamptz)
     AS IMPLICIT;
 
-CREATE FUNCTION @extschema@.timestamptz(@extschema@.schedule_matcher)
+CREATE FUNCTION @extschema@.timestamptz(@extschema@.schedule)
 RETURNS timestamptz[]
 RETURNS NULL ON NULL INPUT
 LANGUAGE SQL
@@ -39,8 +40,49 @@ $BODY$
 SECURITY INVOKER
 STABLE;
 
-CREATE CAST (@extschema@.schedule_matcher AS timestamptz[])
-    WITH FUNCTION @extschema@.timestamptz(@extschema@.schedule_matcher)
+CREATE CAST (@extschema@.schedule AS timestamptz[])
+    WITH FUNCTION @extschema@.timestamptz(@extschema@.schedule)
+    AS IMPLICIT;
+
+CREATE FUNCTION @extschema@.text(@extschema@.schedule)
+RETURNS text
+RETURNS NULL ON NULL INPUT
+LANGUAGE SQL
+AS
+$BODY$
+    SELECT CASE
+                WHEN $1.utc_string is null
+                THEN $1.input
+            ELSE
+                $1.utc_string::text
+            END;
+$BODY$
+SECURITY INVOKER
+IMMUTABLE;
+
+CREATE CAST (@extschema@.schedule AS text)
+    WITH FUNCTION @extschema@.text(@extschema@.schedule)
+    AS IMPLICIT;
+
+CREATE FUNCTION @extschema@.schedule(timestamptz [])
+RETURNS @extschema@.schedule
+RETURNS NULL ON NULL INPUT
+LANGUAGE SQL
+AS
+$BODY$
+    SELECT null::int[],
+           null::int[],
+           null::int[],
+           null::int[],
+           null::int[],
+           $1::text,
+           array(SELECT to_char(unnest at time zone 'utc', 'YYYY-MM-DD HH24:MI OF') from unnest($1) order by 1);
+$BODY$
+SECURITY INVOKER
+STABLE;
+
+CREATE CAST (timestamptz[] AS @extschema@.schedule)
+    WITH FUNCTION @extschema@.schedule(timestamptz [])
     AS IMPLICIT;
 
 CREATE FUNCTION @extschema@.parse_cronfield (cronfield text, minvalue int, maxvalue int)
@@ -100,15 +142,15 @@ COMMENT ON FUNCTION @extschema@.parse_cronfield (text, int, int) IS
 -- it as part of a check constraint. We ensure that there are only
 -- valid entries in the job table.
 -- Main source for decicions is man 5 crontab
-CREATE FUNCTION @extschema@.schedule_matcher(schedule text)
-RETURNS @extschema@.schedule_matcher
+CREATE FUNCTION @extschema@.schedule(text)
+RETURNS @extschema@.schedule
 RETURNS NULL ON NULL INPUT
 LANGUAGE plpgsql
 AS
 $BODY$
 DECLARE
-    entries text [] := regexp_split_to_array(schedule, '\s+');
-    matcher @extschema@.schedule_matcher;
+    entries text [] := regexp_split_to_array($1, '\s+');
+    matcher @extschema@.schedule;
     utc_times timestamptz[];
 BEGIN
     -- Allow some named entries, we transform them into the documented equivalent
@@ -125,6 +167,8 @@ BEGIN
            entries := ARRAY['0','*','*','*','*'];
         END IF;
     END IF;
+
+    matcher.input := $1;
 
     IF array_length(entries, 1) = 5 THEN
         matcher.minute := parse_cronfield(entries[1],0,59);
@@ -161,35 +205,32 @@ BEGIN
     -- We couldn't validate this entry as a crontab entry, so we try timestamps now
     -- We do not use to_timestamptz functionality, as this would render our function
     -- STABLE instead of IMMUTABLE and therefore not indexable.
-    -- We require the arry to be in the 'YYYY-MM-DD HH24:MI OF' format, OF being +00
+    -- We require the array to be in the 'YYYY-MM-DD HH24:MI OF' format, OF being +00
+    -- This is mainly useful for reparsing our own output (eat your own ...)
 
     -- Convert the timestamp to utc, convert to string, sort
-    matcher.utc_string := array(SELECT unnest FROM unnest(format('{%s}', schedule)::text[]) ORDER BY 1);
+    matcher.utc_string := array(SELECT unnest FROM unnest(format('{%s}', $1)::text[]) ORDER BY 1);
 
     RETURN matcher;
 EXCEPTION
     --WHEN data_exception THEN
     WHEN division_by_zero THEN
         RAISE SQLSTATE '22P02' USING
-            MESSAGE = 'Invalid syntax for schedule',
-            DETAIL  = format('"%s" cannot be converted into a schedule', schedule),
+            MESSAGE = 'Invalid syntax for @extschema@.schedule',
+            DETAIL  = format('"%s" cannot be converted into a @extschema@.schedule', @extschema@.schedule),
             HINT    = 'Allowed is: a valid crontab-style entry, a(n array of) "YYYY-MM-DD HH24:MI +00" timestamp(s)';
 END;
 $BODY$
 SECURITY INVOKER
 IMMUTABLE;
 
-COMMENT ON FUNCTION @extschema@.schedule_matcher (schedule text) IS
+COMMENT ON FUNCTION @extschema@.schedule(text) IS
 'Tries to parse a string into 5 int[] containing the expanded values for this entry.
 Most crontab style entries are allowed.
 
-Returns null on non-crontab format, raises exception on invalid crontab format.
+If no valid crontab is found, it tries to parse the string as:
+a(n array of) "YYYY-MM-DD HH24:MI +00" timestamp(s)';
 
-Expanding 7-55/9 would for example become: {7,16,25,34,43,52}
-
-This structure is useful for building an index which can be used for quering which job
-should be run at a specific time.';
-
-CREATE CAST (text AS @extschema@.schedule_matcher)
-    WITH FUNCTION @extschema@.schedule_matcher(text)
+CREATE CAST (text AS @extschema@.schedule)
+    WITH FUNCTION @extschema@.schedule(text)
     AS IMPLICIT;
