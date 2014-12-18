@@ -9,7 +9,7 @@ DECLARE
     utc_strings text[];
 BEGIN
     -- If this already is a valid crontab, do nothing
-    IF (@extschema@.parse_crontab(schedule)).minute IS NOT NULL THEN
+    IF (@extschema@.schedule_matcher(schedule)).minute IS NOT NULL THEN
         RETURN null;
     END IF;
 

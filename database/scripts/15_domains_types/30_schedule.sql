@@ -1,8 +1,8 @@
 CREATE DOMAIN @extschema@.schedule AS TEXT
 CONSTRAINT is_valid_schedule CHECK (
-    parse_crontab(VALUE) IS NOT NULL
+    VALUE IS NULL
     OR
-    parse_truncate_timestamps(VALUE) IS NOT NULL
+    schedule_matcher(VALUE) IS NOT NULL
 );
 
 COMMENT ON DOMAIN @extschema@.schedule IS
