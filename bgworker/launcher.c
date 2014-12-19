@@ -187,32 +187,37 @@ init_table_names(const char *schema_name)
 	MemoryContextSwitch(odlcxct);
 }
 
+bool check_worker_alive(int i)
+{
+	pid_t 	pid;
+
+	if (wstate[i.handle == NULL)
+		return false;
+	else if (GetBackgroundWorkerPid(handle, &pid) != BGWH_STARTED)
+	{
+		/* cleanup */
+		pfree(wstate[i].hanlde);
+		wstate[i].handle = NULL;
+		dsm_detach(wstate[i].segment);
+		elog(LOG, "worker %d is registered as terminated", pid)
+
+		return false;
+	}
+	return true;
+}
+
 /* Cleanup after workers that terminated. */
 static void
 check_for_terminated_workers()
 {
 	int 	i;
-	pid_t 	pid;
 
 	/* Workers are terminated by the postmaster, we are signaled
 	 * afterwards and need to query each one's handle and release
 	 * resources for those that are marked as done.
 	 */
 	for (i = 0; i < launcher_max_workers; i++)
-	{
-		BackgroundWorkerHandle *handle = wstate[i].handle;
-		/* if worker is not running - release it's handle and shared memory */
-		if (handle != NULL && GetBackgroundWorkerPid(handle, &pid) != BGWH_STARTED)
-		{
-			pfree(handle);
-			wstate[i].handle = NULL;
-			/* since we are the only process that is attached to the shmem block,
-			 * it should be released automatically.
-			 */
-			dsm_detach(wstate[i].segment);
-			elog(LOG, "worker %d has terminated", pid);
-		}
-	}
+		check_worker_alive(i);
 }
 
 static Datum
@@ -225,6 +230,51 @@ static char *
 get_text_via_spi(SPITupleTable *tuptable, const char *colname)
 {
 	return SPI_gevalue(tuptable->vals[i], tuptable->tupdesc, SPI_fnumber(tuptable->tupdesc, colname));
+}
+
+/*
+ * Launch a new worker and put its data into the launcher slot with a
+ * given index.
+ */
+static void
+launch_worker(int index, JobDesc *job_desc)
+{
+	int  	i;
+	BackgroundWorkerHandle  	*handle;
+	/* Check if no jobs are running with the same id */
+	if (job_desc->parallel == false)
+	{
+		for (i = 0; i < launcher_max_workers; i++)
+		{
+			if (i == index || wstate[i].handle == NULL)
+				continue;
+			if (wstate[i].job_id == job_desc->job_id)
+			{
+				/*
+				 * Another job with the same id, but we only
+				 * allow one at a time. Check whether the old
+				 * one is still alive
+				 */
+				 if (check_worker_alive(i))
+				 {
+				 	elog(WARNING, "could not run multiple instances of job %d: parallel execution is disabled for it");
+				 	return;
+				 }
+			}
+		}
+	}
+	/* prepare the structure to run the job */
+	wstate[i].segment = dsm_create(offset(command, JobDesc) + strlen(job_desc->command) + 1);
+	fill_job_description(&wstate[i].segment,
+						 job_desc->job_id,
+						 job_desc->command,
+						 job_desc->datname,
+						 job_desc->rolname,
+						 job_desc->parallel,
+						 job_desc->job_timeout);
+	wstate[i].job_id = job_desc->job_id;
+	/* code to actually launch the worker */
+
 }
 
 static void run_scheduled_jobs()
@@ -314,16 +364,12 @@ static void run_scheduled_jobs()
 		{
 			if (wstate[i].handle == NULL)
 			{
+				BackgroundWorkerHandle  	*handle;
 				/* We found a free slot, let's use it */
 				wstate[i].segment = dsm_create(offset(command, JobDesc) + strlen(job_desc->command) + 1);
-				fill_job_desription(&wstate[i].segment,
-									job_desc->job_id,
-									job_desc->command,
-									job_desc->datname,
-									job_desc->rolname,
-									job_desc->parallel,
-									job_desc->job_timeout);
+				
 				/* Launch the new worker if we don't have one for the job already*/
+				launch_worker(i, job_desc);
 			}
 		}
 	}
