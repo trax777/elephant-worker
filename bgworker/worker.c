@@ -13,7 +13,7 @@
 
 /* bgworker mandatory includes */
 #include "miscadmin.h"
-#include "postmaster/pgworker.h"
+#include "postmaster/bgworker.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lwlock.h"
@@ -31,12 +31,17 @@
 #include "tcop/utility.h"
 
  /* Our own include files */
-include "job.h"
+#include "commons.h"
+#include "job.h"
+
+#define PROCESS_NAME "elephant worker"
 
 static volatile sig_atomic_t got_sighup = false;
 static volatile sig_atomic_t got_sigterm = false;
 
 static JobDesc *job;
+
+static db_object_data  job_run_function
 
 
 /* Signal handler for SIGHUP
@@ -81,7 +86,7 @@ initialize_worker(uint32 segment)
 	 * In order to attach a dynamic shared memory segment, we need a
 	 * resource owner.
 	 */
-	 CurrentResourceOwner = ResourceOwnerCreate(NULL, EXTENSION_NAME);
+	 CurrentResourceOwner = ResourceOwnerCreate(NULL, PROCESS_NAME);
 
 	 seg = dsm_attach(segment);
 	 if (seg == NULL)
@@ -89,18 +94,22 @@ initialize_worker(uint32 segment)
 	 			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 	 			 errmsg("unable to map dynamic shared memory segment")));
 	 /* copy the arguments from shared memory segment */
-	 job = copy_job_description(dsm_segment_address(seg));
-	 if (!job)
-	 	erreport(ERROR,
-	 			 (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-	 			  errmsg("unable to obtain job definition from shared memory")));
+	 memcpy(job, dsm_segment_address(seg), sizeof(JobDesc));
 	 /* and detach it right away */
 	 dsm_dettach(segment);
+
+	 /* Initialize schema objects to query */
+	 /* Allocate them in a persistent context */
+	 MemoryContext    *oldcxt = MemoryContextSwitchTo(TopTransactionContext);
+
+	 job_run_function->schema = quote_identifier(job->schemaname);
+	 job_run_function = quote_identifier("run_job");
+	 MemoryContextSwitchTo(oldxct);
+
 }
 
 void worker_main(Datum arg)
 {
-	JobDesc    	  *job;
 	StringInfoData 	buf;
 	uint32 			segment = Uint32GetDatum(arg);
 
@@ -116,13 +125,16 @@ void worker_main(Datum arg)
 	/* Connect to the database */
 	BackgroundWorkerInitializeConnection(job->datname, job->usename);
 
-	elog(LOG, "%s initialized running job id %d", MyBgworkerEntry->bgw_name, job->id);
+	elog(LOG, "%s initialized running job id %d", MyBgworkerEntry->bgw_name, job->job_id);
 	pgstat_report_appname(MyBgworkerEntry->bgw_name);
 
 	/* Initialize the query text */
 	InitStringInfo(&buf);
 	appendStringInfo(&buf,
-					job->command);
+					"SELECT * FROM %s.%s(%d, NULL)",
+					job_run_function.schema,
+					job_run_function.name,
+					job->job_id);
 
 	/* Initialize the SPI subsystem */
 	SetCurrentStatementStartTimestamp()

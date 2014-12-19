@@ -11,24 +11,18 @@
 
 #include "jobs.h"
 
- /* allocate a new copy Job Description structure and copy the existing one there */
-JobDesc *
-copy_job_description(JobDesc *source)
-{
-	Size 	size = offsetof(JobDesc, command) + strlen(source->command) + 1;
-	result = palloc(size);
-	memcpy(result, source, size);
-	return result;
-}
 
 void
-fill_job_description(JobDesc *desc, uint32 id, char *command, char *datname, char *rolname, bool parallel, uint32 timeout)
+fill_job_description(JobDesc *desc, uint32 id, uint32 log_id,
+					 char *datname, char *rolname,
+					 char *schema, bool parallel,
+					 uint32 timeout)
 {
 	desc->job_id = id;
-	desc->job_log_id = 0
+	desc->job_log_id = log_id
 	desc->job_timeout = timeout;
 	desc->parallel = parallel;
 	snprintf(desc->datname, MAXNAMELEN, "%s", datname);
 	snprintf(desc->rolname, MAXNAMELEN, "%s", rolname);
-	strcpy(desc->command, command);
+	snprintf(desc->schemaname, MAXNAMELEN, "%s", schema)
 }

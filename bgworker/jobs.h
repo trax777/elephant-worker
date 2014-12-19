@@ -18,12 +18,15 @@ typedef struct JobDesc
 	uint32	job_log_id;
 	uint32 	job_timeout;
 	bool    parallel;
-	char 	datname[NAMELEN]
-	char 	rolname[NAMELEN]
-	char    command[FLEXIBLE_ARRAY_MEMBER]
+	char 	datname[NAMELEN];
+	char 	rolname[NAMELEN];
+	char 	schemaname[NAMELEN];
 } JobDesc;
 
-void fill_job_description(JobDesc *desc, uint32 id, char *command, char *datname, char *rolname, bool parallel, uint32 timeout);
+void fill_job_description(JobDesc *desc, uint32 id,
+						  char *datname, char *rolname,
+						  char *schema, bool parallel,
+						  uint32 timeout);
 JobDesc * copy_job_description(JobDesc *source);
 
 #endif /* _JOBS_H */
