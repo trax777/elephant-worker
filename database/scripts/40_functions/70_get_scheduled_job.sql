@@ -21,13 +21,13 @@ BEGIN
       JOIN pg_catalog.pg_roles    pr ON (job.roloid = pr.oid)
       JOIN pg_catalog.pg_database pd ON (job.datoid = pd.oid)
      WHERE pg_has_role(session_user, roloid, 'MEMBER')
-       AND (parse_crontab(schedule)).minute @> minute
-       AND (parse_crontab(schedule)).hour   @> hour
-       AND (parse_crontab(schedule)).month  @> month
+       AND (@extschema@.parse_crontab(schedule)).minute @> minute
+       AND (@extschema@.parse_crontab(schedule)).hour   @> hour
+       AND (@extschema@.parse_crontab(schedule)).month  @> month
        AND (
-                (parse_crontab(schedule)).dom @> dom
+                (@extschema@.parse_crontab(schedule)).dom @> dom
                 OR
-                (parse_crontab(schedule)).dow @> dow
+                (@extschema@.parse_crontab(schedule)).dow @> dow
            )
        AND enabled = true
 
@@ -40,7 +40,7 @@ BEGIN
       JOIN pg_catalog.pg_roles    pr ON (job.roloid = pr.oid)
       JOIN pg_catalog.pg_database pd ON (job.datoid = pd.oid)
      WHERE pg_has_role(session_user, roloid, 'MEMBER')
-       AND parse_truncate_timestamps(schedule) @> utc_string
+       AND @extschema@.parse_truncate_timestamps(schedule) @> utc_string
        AND enabled = true;
 END;
 $BODY$
