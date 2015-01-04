@@ -104,11 +104,11 @@ BEGIN
         END IF;
     END IF;
 
-    minute := parse_cronfield(entries[1],0,59);
-    hour   := parse_cronfield(entries[2],0,23);
-    dom    := parse_cronfield(entries[3],1,31);
-    month  := parse_cronfield(entries[4],1,12);
-    dow    := parse_cronfield(entries[5],0,7);
+    minute := @extschema@.parse_cronfield(entries[1],0,59);
+    hour   := @extschema@.parse_cronfield(entries[2],0,23);
+    dom    := @extschema@.parse_cronfield(entries[3],1,31);
+    month  := @extschema@.parse_cronfield(entries[4],1,12);
+    dow    := @extschema@.parse_cronfield(entries[5],0,7);
 
     -- if any entry is null, the crontab is invalid
     IF minute IS NULL OR hour IS NULL OR month IS NULL OR dom IS NULL or dow IS NULL THEN
@@ -604,13 +604,13 @@ BEGIN
       JOIN pg_catalog.pg_roles    pr ON (job.roloid = pr.oid)
       JOIN pg_catalog.pg_database pd ON (job.datoid = pd.oid)
      WHERE pg_has_role(session_user, roloid, 'MEMBER')
-       AND (parse_crontab(schedule)).minute @> minute
-       AND (parse_crontab(schedule)).hour   @> hour
-       AND (parse_crontab(schedule)).month  @> month
+       AND (@extschema@.parse_crontab(schedule)).minute @> minute
+       AND (@extschema@.parse_crontab(schedule)).hour   @> hour
+       AND (@extschema@.parse_crontab(schedule)).month  @> month
        AND (
-                (parse_crontab(schedule)).dom @> dom
+                (@extschema@.parse_crontab(schedule)).dom @> dom
                 OR
-                (parse_crontab(schedule)).dow @> dow
+                (@extschema@.parse_crontab(schedule)).dow @> dow
            )
        AND enabled = true
 
@@ -623,7 +623,7 @@ BEGIN
       JOIN pg_catalog.pg_roles    pr ON (job.roloid = pr.oid)
       JOIN pg_catalog.pg_database pd ON (job.datoid = pd.oid)
      WHERE pg_has_role(session_user, roloid, 'MEMBER')
-       AND parse_truncate_timestamps(schedule) @> utc_string
+       AND @extschema@.parse_truncate_timestamps(schedule) @> utc_string
        AND enabled = true;
 END;
 $BODY$

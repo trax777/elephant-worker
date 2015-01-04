@@ -85,11 +85,11 @@ BEGIN
         END IF;
     END IF;
 
-    minute := parse_cronfield(entries[1],0,59);
-    hour   := parse_cronfield(entries[2],0,23);
-    dom    := parse_cronfield(entries[3],1,31);
-    month  := parse_cronfield(entries[4],1,12);
-    dow    := parse_cronfield(entries[5],0,7);
+    minute := @extschema@.parse_cronfield(entries[1],0,59);
+    hour   := @extschema@.parse_cronfield(entries[2],0,23);
+    dom    := @extschema@.parse_cronfield(entries[3],1,31);
+    month  := @extschema@.parse_cronfield(entries[4],1,12);
+    dow    := @extschema@.parse_cronfield(entries[5],0,7);
 
     -- if any entry is null, the crontab is invalid
     IF minute IS NULL OR hour IS NULL OR month IS NULL OR dom IS NULL or dow IS NULL THEN
