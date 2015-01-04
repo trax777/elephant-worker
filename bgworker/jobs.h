@@ -18,12 +18,13 @@ typedef struct JobDesc
 	uint32	job_log_id;
 	uint32 	job_timeout;
 	bool    parallel;
-	char 	datname[NAMELEN];
-	char 	rolname[NAMELEN];
-	char 	schemaname[NAMELEN];
+	char 	datname[NAMEDATALEN];
+	char 	rolname[NAMEDATALEN];
+	char 	schemaname[NAMEDATALEN];
 } JobDesc;
 
-void fill_job_description(JobDesc *desc, uint32 id,
+void fill_job_description(JobDesc *desc,
+						  uint32 id, uint32 log_id,
 						  char *datname, char *rolname,
 						  char *schema, bool parallel,
 						  uint32 timeout);

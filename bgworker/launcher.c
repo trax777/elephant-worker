@@ -25,13 +25,16 @@
 #include "fmgr.h"
 #include "lib/stringinfo.h"
 #include "pgstat.h"
+#include "postmaster/postmaster.h"
 #include "utils/builtins.h"
+#include "utils/memutils.h"
 #include "utils/snapmgr.h"
+#include "storage/dsm.h"
 #include "tcop/utility.h"
 
 /* Our own include files */
 #include "commons.h"
-#include "job.h"
+#include "jobs.h"
 #include "worker.h"
 
 #define PROCESS_NAME "elephant launcher"
@@ -62,7 +65,7 @@ typedef struct worker_state
 
 static worker_state 	*wstate;
 
-static char 			 schema_name[MAXNAMELEN];
+static char 			 schema_name[NAMEDATALEN];
 
 static db_object_data    job_table;
 static db_object_data    log_table;
@@ -70,15 +73,15 @@ static db_object_data 	 schedule_function;
 
 
 static Datum
-get_attribute_via_spi(SPITupleTable *tuptable, const char *colname, bool *isnull)
+get_attribute_via_spi(SPITupleTable *tuptable, int rowno, const char *colname, bool *isnull)
 {
-	return SPI_getbinval(tuptable->vals[i], tuptable->tupdesc, SPI_fnumber(tuptable->tupdesc, colname), isnull)
+	return SPI_getbinval(tuptable->vals[rowno], tuptable->tupdesc, SPI_fnumber(tuptable->tupdesc, colname), isnull);
 }
 
 static char *
-get_text_via_spi(SPITupleTable *tuptable, const char *colname)
+get_text_via_spi(SPITupleTable *tuptable, int rowno, const char *colname)
 {
-	return SPI_gevalue(tuptable->vals[i], tuptable->tupdesc, SPI_fnumber(tuptable->tupdesc, colname));
+	return SPI_getvalue(tuptable->vals[rowno], tuptable->tupdesc, SPI_fnumber(tuptable->tupdesc, colname));
 }
 
 /* Signal handler for SIGHUP
@@ -105,7 +108,7 @@ launcher_sigusr1(SIGNAL_ARGS)
 	int 		save_errno = errno;
 
 	/* Necessary for the latches to work properly, as they are using sigusr1 internally */
-	latch_sigusr1_handler()
+	latch_sigusr1_handler();
 
 	got_sigusr1 = true;
 
@@ -139,41 +142,43 @@ init_launcher()
 	int 	i;
 
 	/* allocate the workers state in the global context */
-	wstate = MemoryContextAlloc(TopTransactionContext,
-								sizeof(worker_state) * launcher_max_workers);
-	CurrentResourceOwner = ResourceOwnerCreate(NULL, PROCESS_NAME);
+	wstate = palloc0(sizeof(worker_state) * launcher_max_workers);
+	/*CurrentResourceOwner = ResourceOwnerCreate(NULL, PROCESS_NAME);*/
+	pgstat_report_activity(STATE_RUNNING, "launcher initialization");
 }
 
 static char *
 launcher_get_extension_schema(char *extname)
 {
-	StringInfo 	buf;
-	char 		*tmp;
+	StringInfoData 	buf;
+	char 		   *tmp;
 
 	if (!extname)
 		return NULL;
 
-	/* Initialize SPI */
-	SetCurrentTransactionTimestamp();
-	StartTransactionCommand();
-	SPI_connect();
-	PushActiveSnapshot(GetTransactionSnapshot());
 
-	InitStringInfo(&buf);
+	initStringInfo(&buf);
 	appendStringInfo(&buf, "SELECT nsp.nspname "
 						   "FROM   pg_catalog.pg_namespace nsp JOIN pg_catalog.pg_extension ext "
 						   "ON (nsp.oid = ext.extnamespace) "
 						   "WHERE ext.extname = %s", quote_literal_cstr(EXTENSION_NAME));
 
-	pgstat_report_activity(STATE_RUNNING, buf.data);
-	/* Query system catalogs for the given extension */
+	/* Initialize SPI */
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	SPI_connect();
+	PushActiveSnapshot(GetTransactionSnapshot());
 
-	if (SPI_execute(buf.data, false, 1) != SPI_OK_SELECT || SPI_processed == 1)
+	pgstat_report_activity(STATE_RUNNING, "locating the extension schema");
+	SetCurrentStatementStartTimestamp();
+
+	/* Query system catalogs for the given extension */
+	if (SPI_execute(buf.data, false, 1) != SPI_OK_SELECT || SPI_processed != 1)
 		elog(FATAL, "could not query system catalogs for extension %s", EXTENSION_NAME);
-	tmp = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, MAXNAMELEN);
+	tmp = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
 	if (!tmp)
 		elog(FATAL, "%s returned NULL result");
-	strncpy(schema_name, tmp, MAXNAMELEN));
+	strncpy(schema_name, tmp, NAMEDATALEN);
 
 	/* finish the SPI query */
 	SPI_finish();
@@ -187,7 +192,6 @@ static void
 init_table_names()
 {
 	/* Allocate them in a persistent context */
-	MemoryContext    *oldcxt = MemoryContextSwitchTo(TopTransactionContext);
 
 	log_table.name = quote_identifier("job_log");
 	log_table.schema = quote_identifier(schema_name);
@@ -197,23 +201,21 @@ init_table_names()
 
 	schedule_function.name = quote_identifier("job_scheduled_at");
 	schedule_function.schema = quote_identifier(schema_name);
-
-	MemoryContextSwitchTo(odlcxct);
 }
 
 bool check_worker_alive(int i)
 {
 	pid_t 	pid;
 
-	if (wstate[i.handle == NULL)
+	if (wstate[i].handle == NULL)
 		return false;
-	else if (GetBackgroundWorkerPid(handle, &pid) != BGWH_STARTED)
+	else if (GetBackgroundWorkerPid(wstate[i].handle, &pid) != BGWH_STARTED)
 	{
 		/* cleanup */
-		pfree(wstate[i].hanlde);
+		pfree(wstate[i].handle);
 		wstate[i].handle = NULL;
 		dsm_detach(wstate[i].segment);
-		elog(LOG, "worker %d has terminated", pid)
+		elog(LOG, "worker %d has terminated", pid);
 
 		return false;
 	}
@@ -326,43 +328,49 @@ launch_worker(int index, JobDesc *job_desc)
 	{
 		/* cleanup the resource we've allocated */
 		dsm_detach(segment);
-		wstate[i].handle = NULL;
+		wstate[index].handle = NULL;
 	}
 }
 
 /* Check if there are jobs scheduled to run and spawn worker subprocesses to run them. */
 static void run_scheduled_jobs()
 {
-	StringInfo 	buf;
-	int 		ret;
-	int 		i;
-	List 		*scheduled_jobs;
-	ListCell  	*lc;
+	StringInfoData 	buf;
+	int 			ret;
+	int 			i;
+	MemoryContext 	uppercxt;
+	ListCell  	   *lc;
+	List 		   *scheduled_jobs = NIL;
+
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "SELECT job_id,"
+								   "parallel,"
+								   "extract(epoch from job_timeout) as job_timeout,"
+								   "datname,"
+								   "rolname "
+							  "FROM %s.%s()",
+							  schedule_function.schema,
+							  schedule_function.name);
+
+	uppercxt = CurrentMemoryContext;
 
 	/* First, check if there are jobs to run */
-	SetCurrentTransactionTimestamp();
+	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
 	SPI_connect();
 	PushActiveSnapshot(GetTransactionSnapshot());
 
-	InitStringInfo(&buf);
-	appendStringInfo(&buf, "SELECT job_id,
-								   parallel,
-								   extract(epoch from job_timeout) as job_timeout,
-								   datname,
-								   rolname
-							  FROM %s.%s()",
-							  schedule_function->schema,
-							  schedule_function->name);
-	pgstat_report_activity(STATE_RUNNING, buf);
+	pgstat_report_activity(STATE_RUNNING, buf.data);
+
+	SetCurrentStatementStartTimestamp();
 	ret = SPI_execute(buf.data, false, 0);
+
 	if (ret < 0)
 		elog(FATAL, "cannot obtain list of jobs to run");
-	/* No scheduled jobs at this time, check back later */
-	if (SPI_processed == 0)
-		return;
 
 	/* Get the oids of jobs to run */
+	elog(LOG, "fetching attributes");
 	for (i = 0; i < SPI_processed; i++)
 	{
 		char   *datname;
@@ -372,47 +380,49 @@ static void run_scheduled_jobs()
 		uint32	job_timeout;
 		bool 	isnull;
 		bool 	parallel;
-		MemoryContext *oldcxt;
+		MemoryContext  oldcxt;
 		JobDesc 	  *job_desc;
 
 		/* fetch interesting attributes */
-		job_id = DatumGetUInt32(get_attribute_via_spi(SPI_tuptable, "job_id", &isnull);
+		job_id = DatumGetUInt32(get_attribute_via_spi(SPI_tuptable, i, "job_id", &isnull));
 		Assert(!isnull);
 
-		datname = get_text_via_spi(SPI_tuptable, "datname");
+		datname = get_text_via_spi(SPI_tuptable, i, "datname");
 		Assert(len(datname) > 0);
 
-		rolname = get_text_via_spi(SPI_tuptable, "rolname");
-		Assert(len(rolname)) > 0;
+		rolname = get_text_via_spi(SPI_tuptable, i, "rolname");
+		Assert(len(rolname) > 0);
 
-
-		parallel = DatumGetBool(get_attribute_via_spi(SPI_tuptable, "parallel"), &isnull);
+		parallel = DatumGetBool(get_attribute_via_spi(SPI_tuptable, i, "parallel", &isnull));
 		Assert(!isnull);
 
-		job_timeout = DatumGetInt32(get_attribute_via_spi(SPI_tuptable, "job_timeout"), &isnull);
+		job_timeout = DatumGetInt32(get_attribute_via_spi(SPI_tuptable, i, "job_timeout", &isnull));
 		Assert(!isnull);
 
 		/*
-		 * Allocate a new job description in the top transaction context, so it does not go away
+		 * Allocate a new job description in the permanent context, so it does not go away
 		 * after SPI_finish.
 		 */
-		oldcxt = MemoryContextSwitchTo(TopTransactionContext);
+		oldcxt = MemoryContextSwitchTo(uppercxt);
 		job_desc = palloc(sizeof(JobDesc));
 		fill_job_description(job_desc, job_id, 0, datname, rolname, schema_name, parallel, job_timeout);
-		MemoryContextSwitchTo(oldxct);
+
 
 		scheduled_jobs = lappend(scheduled_jobs, job_desc);
+		MemoryContextSwitchTo(oldcxt);
 	}
+
 	/* We are done with the database, finish the SPI call */
 	SPI_finish();
 	PopActiveSnapshot();
 	CommitTransactionCommand();
+
 	pgstat_report_activity(STATE_IDLE, NULL);
 
 	/* Now launch the child processes */
 	foreach(lc, scheduled_jobs)
 	{
-		job_desc = lfirst(lc);
+		JobDesc   *job_desc = lfirst(lc);
 		for (i = 0; i < launcher_max_workers; i++)
 		{
 			/* Look for a first free slot */
@@ -420,7 +430,7 @@ static void run_scheduled_jobs()
 			{
 				/* Launch the new worker if we don't have one for the job already*/
 				launch_worker(i, job_desc);
-				break
+				break;
 			}
 		}
 		elog(WARNING, "unable to launch more job: all available worker slots are occupied",
@@ -430,7 +440,7 @@ static void run_scheduled_jobs()
 	list_free_deep(scheduled_jobs);
 }
 
-void launcher_main(Datum arg)
+Datum launcher_main(PG_FUNCTION_ARGS)
 {
 	/* Setup signal handlers */
 	pqsignal(SIGHUP, launcher_sighup);
@@ -441,9 +451,10 @@ void launcher_main(Datum arg)
 	BackgroundWorkerUnblockSignals();
 
 	init_launcher();
-	BackgroundWorkerInitializeConnnection(launcher_database, NULL);
+	BackgroundWorkerInitializeConnection(launcher_database, NULL);
 	launcher_get_extension_schema(EXTENSION_NAME);
 	init_table_names();
+	elog(LOG, "entering main loop");
 
 	/* loop until SIGTERM will command us to exit */
 	while (!got_sigterm)
@@ -543,6 +554,7 @@ void _PG_init(void)
    worker.bgw_notify_pid = 0;
    snprintf(worker.bgw_name, BGW_MAXLEN, PROCESS_NAME);
    worker.bgw_main_arg = (Datum) 0;
+   worker.bgw_restart_time = BGW_NEVER_RESTART;
 
    RegisterBackgroundWorker(&worker);
 }

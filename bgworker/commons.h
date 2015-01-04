@@ -7,9 +7,15 @@
  * ------------------------------------------------------------------------
  */
 
-#ifndef _JOBS_H
-#define _JOBS_H
+#ifndef _COMMONS_H
+#define _COMMONS_H
 
 #define EXTENSION_NAME  "elephant_worker"
+
+ typedef struct db_object_data
+ {
+ 	char   *schema;
+ 	char   *name;
+ } db_object_data;
 
 #endif /* _JOBS_H */

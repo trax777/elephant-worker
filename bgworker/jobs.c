@@ -13,16 +13,17 @@
 
 
 void
-fill_job_description(JobDesc *desc, uint32 id, uint32 log_id,
+fill_job_description(JobDesc *desc,
+					 uint32 id, uint32 log_id,
 					 char *datname, char *rolname,
 					 char *schema, bool parallel,
 					 uint32 timeout)
 {
 	desc->job_id = id;
-	desc->job_log_id = log_id
+	desc->job_log_id = log_id;
 	desc->job_timeout = timeout;
 	desc->parallel = parallel;
-	snprintf(desc->datname, MAXNAMELEN, "%s", datname);
-	snprintf(desc->rolname, MAXNAMELEN, "%s", rolname);
-	snprintf(desc->schemaname, MAXNAMELEN, "%s", schema)
+	snprintf(desc->datname, NAMEDATALEN, "%s", datname);
+	snprintf(desc->rolname, NAMEDATALEN, "%s", rolname);
+	snprintf(desc->schemaname, NAMEDATALEN, "%s", schema);
 }

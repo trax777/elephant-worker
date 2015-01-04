@@ -1,0 +1,5 @@
+relocatable = false
+superuser   = true
+comment 	= 'Job Scheduler using background workers'
+default_version = 1.0
+module_pathname = '$libdir/elephant_worker'
